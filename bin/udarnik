@@ -1,0 +1,743 @@
+#!/usr/bin/env bash
+# udarnik: keeps Claude Code sessions going across several accounts when one runs out of quota.
+#
+#   udarnik start [--context TEXT] [--only ID,ID] [--root DIR]   turn it on (one transient systemd user service)
+#   udarnik status [--json]                                       accounts, sessions, clones, workers, log
+#   udarnik stop [--all]                                          turn it off; --all also ends the clones
+#   udarnik view [WINDOW|ID] [--print]                            open a terminal attached to the clones' tmux server
+#   udarnik account <sub>                                         account hook for runners (see README)
+#
+# The service watches every live interactive session of every account (or only those at or below --root). When the last
+# answer of one is the usage-limit error, it closes that process, copies the history to an account with quota and
+# resumes a fork of it in a tmux window. The clone is watched like any other session, which chains the takeover.
+# This program never makes a network call.
+set -Eeuo pipefail
+IFS=$'\n\t'
+umask 077
+
+# Resolve symlinks (~/.local/bin/udarnik points at the installed tree).
+SCRIPT_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)
+TOOL_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
+# shellcheck source=../lib/accounts.sh
+source "$TOOL_DIR/lib/accounts.sh"
+
+PROBE="$TOOL_DIR/lib/session_probe.py"
+STATE=$(udarnik_state_dir)
+UNIT=${UDARNIK_UNIT:-udarnik}
+TMUX_SOCKET=${UDARNIK_TMUX_SOCKET:-udarnik}
+TMUX_SESSION=udarnik
+POLL_SECONDS=${UDARNIK_POLL_SECONDS:-120}
+CLAUDE_COMMAND=${UDARNIK_CLAUDE:-claude}
+
+die() { printf 'udarnik: %s\n' "$*" >&2; exit 2; }
+note() { printf '%s\n' "$*"; }
+log() { udarnik_log "$@"; }
+tmux_cmd() { tmux -L "$TMUX_SOCKET" "$@"; }
+now() { date +%s; }
+
+usage() {
+  cat <<'USAGE'
+Usage: udarnik <command>
+
+Commands:
+  start [--context TEXT] [--only ID,ID] [--root DIR]
+                                Turn the takeover on and start the service. Each call rewrites the three options
+                                (an absent option is cleared).
+  status [--json]               Accounts, watched sessions, clones, workers and the log
+  stop [--all]                  Turn it off (clones stay alive); --all also ends the service and the clones
+  view [WINDOW|ID] [--print]    Open a terminal attached to the clones' tmux (on that window); --print only prints
+  account <sub>                 Account hook for runners:
+                                  enabled            exit 0 when the switch is on, 1 otherwise
+                                  current            the account to use now (the caller's, or the best other one)
+                                  limit ACCOUNT      failure text on stdin; mark ACCOUNT out, print the next account
+                                                     (exit 1: not a limit message, exit 75: no account left)
+                                  next               epoch at which the first account is available again
+                                  env ACCOUNT        the env prefix that runs a command in ACCOUNT
+                                  pick [EXCLUDE...]  the available account with the lowest weekly usage
+USAGE
+}
+
+# ---------------------------------------------------------------- service
+
+service_active() { systemctl --user is-active --quiet "$UNIT.service" 2>/dev/null; }
+
+service_pid() { systemctl --user show -p MainPID --value "$UNIT.service" 2>/dev/null || true; }
+
+# Wakes the service loop so a new switch or filter is read now instead of at the next poll.
+service_wake() {
+  local pid
+  pid=$(service_pid)
+  [[ $pid =~ ^[1-9][0-9]*$ ]] && kill -USR1 "$pid" 2>/dev/null || true
+}
+
+# The service runs from a copy of this tool's tree, so updating the installed tree never changes the script a running
+# service is reading.
+prepare_snapshot() {
+  local target="$STATE/snapshot" staging="$STATE/snapshot.staging"
+  # Started from the snapshot itself: it is already the copy to run.
+  if [[ $TOOL_DIR == "$target" ]]; then printf '%s\n' "$target"; return 0; fi
+  rm -rf -- "$staging"
+  mkdir -p -- "$staging"
+  cp -a -- "$TOOL_DIR/bin" "$TOOL_DIR/lib" "$staging/"
+  rm -rf -- "$target"
+  mv -- "$staging" "$target"
+  printf '%s\n' "$target"
+}
+
+cmd_start() {
+  local context='' only='' root='' arg snapshot variable
+  while (($#)); do
+    arg=$1; shift
+    case "$arg" in
+      --context) (($#)) || die '--context requires a value'; context=$1; shift ;;
+      --only) (($#)) || die '--only requires a value'; only=$1; shift ;;
+      --root) (($#)) || die '--root requires a value'; root=$1; shift ;;
+      *) die "unknown start option: $arg" ;;
+    esac
+  done
+  if [[ -n $root ]]; then
+    root=$(cd -P -- "$root" 2>/dev/null && pwd -P) || die "--root: no such directory: $root"
+    root=${root%/}
+  fi
+  mkdir -p -- "$STATE/accounts"
+  printf '%s' "$context" >"$STATE/context"
+  tr ',' '\n' <<<"$only" | sed '/^[[:space:]]*$/d' >"$STATE/only"
+  if [[ -n $root ]]; then printf '%s\n' "$root" >"$STATE/root"; else rm -f -- "$STATE/root"; fi
+  : >"$STATE/enabled"
+  [[ ${UDARNIK_LINKS:-on} == off ]] || ensure_shared_links
+  if service_active; then
+    service_wake
+    log "start: service already active; context, filter and root updated"
+    note "The service was already active; context, filter and root were updated."
+    note "$(view_hint)"
+    return 0
+  fi
+  snapshot=$(prepare_snapshot)
+  # ~/.local/bin holds the udarnik link and, usually, the claude command (or a wrapper of it); a caller started without
+  # it in PATH must not leave the service resolving claude elsewhere or not at all.
+  local path=$PATH
+  [[ :$path: == *":$HOME/.local/bin:"* ]] || path="$path:$HOME/.local/bin"
+  local -a setenv=("--setenv=PATH=$path" "--setenv=HOME=$HOME" "--setenv=UDARNIK_STATE=$STATE")
+  [[ -z ${TZ:-} ]] || setenv+=("--setenv=TZ=$TZ")
+  for variable in $(compgen -e | grep -E '^UDARNIK_' | grep -vx 'UDARNIK_STATE' || true); do
+    setenv+=("--setenv=$variable=${!variable}")
+  done
+  systemd-run --user --unit="$UNIT" --collect --quiet \
+    --description='udarnik: Claude account takeover' "${setenv[@]}" \
+    "$snapshot/bin/udarnik" _serve
+  log "start: service started (only: ${only:-every session}; root: ${root:-anywhere})"
+  if service_active; then
+    note "Takeover on: service $UNIT is active${only:+ (only: $only)}${root:+ (root: $root)}."
+    note "$(view_hint)"
+  else
+    die "service $UNIT did not stay active; see: journalctl --user -u $UNIT"
+  fi
+}
+
+cmd_stop() {
+  local all=false
+  case "${1:-}" in
+    '') ;;
+    --all) all=true ;;
+    *) die "unknown stop option: $1" ;;
+  esac
+  rm -f -- "$STATE/enabled"
+  if $all; then
+    log "stop --all: ending the service and the clones"
+    systemctl --user stop "$UNIT.service" 2>/dev/null || true
+    tmux_cmd kill-server 2>/dev/null || true
+    if [[ -s $STATE/sessions.json ]]; then
+      sessions_rewrite 'map(if .state == "running" then .state = "ended" else . end)'
+    fi
+    note "Service and clones ended."
+    return 0
+  fi
+  log "stop: switch off; live clones keep running"
+  service_wake
+  note "Takeover off. Live clones keep running; the service leaves by itself when none is left."
+  note "To see the clones: $(attach_command)"
+}
+
+# ---------------------------------------------------------------- account hook
+
+cmd_account() {
+  local sub=${1:-} account next text
+  (($#)) && shift
+  case "$sub" in
+    enabled) udarnik_enabled ;;
+    current)
+      account=$(account_of_env)
+      if udarnik_enabled && ! account_available "$account" && next=$(account_pick "$account"); then account=$next; fi
+      printf '%s\n' "$account"
+      ;;
+    limit)
+      (($#)) || die 'account limit requires ACCOUNT'
+      account=$1
+      text=$(cat)
+      is_limit_text "$text" || return 1
+      account_mark_out "$account" "$text" >/dev/null
+      next=$(account_pick "$account") || return 75
+      printf '%s\n' "$next"
+      ;;
+    next) accounts_next_available_epoch ;;
+    env)
+      (($#)) || die 'account env requires ACCOUNT'
+      account_env "$1"
+      ;;
+    pick) account_pick "$@" ;;
+    *) usage >&2; die "unknown account subcommand: ${sub:-}" ;;
+  esac
+}
+
+# ---------------------------------------------------------------- sessions.json
+
+_sessions_rewrite() {
+  local filter=$1 file="$STATE/sessions.json" temporary
+  shift
+  [[ -s $file ]] || printf '[]\n' >"$file"
+  temporary=$(mktemp "$STATE/.sessions.XXXXXX")
+  if jq "$@" "$filter" "$file" >"$temporary"; then mv -f -- "$temporary" "$file"; else rm -f -- "$temporary"; return 1; fi
+}
+sessions_rewrite() { state_locked sessions _sessions_rewrite "$@"; }
+
+sessions_json() {
+  if [[ -s $STATE/sessions.json ]]; then cat -- "$STATE/sessions.json"; else printf '[]\n'; fi
+}
+
+# ---------------------------------------------------------------- tmux windows
+
+# Prints alive, dead (process ended, pane kept) or gone for a window id.
+window_state() {
+  local line
+  line=$(tmux_cmd list-panes -a -F '#{window_id} #{pane_dead}' 2>/dev/null | awk -v id="$1" '$1 == id { print $2; exit }') || true
+  case "$line" in
+    0) printf 'alive\n' ;;
+    1) printf 'dead\n' ;;
+    *) printf 'gone\n' ;;
+  esac
+}
+
+window_pane_pid() { tmux_cmd list-panes -t "$1" -F '#{pane_pid}' 2>/dev/null | head -1 || true; }
+
+descendants() {
+  local pid=$1 child
+  printf '%s\n' "$pid"
+  for child in $(pgrep -P "$pid" 2>/dev/null || true); do descendants "$child"; done
+}
+
+# ---------------------------------------------------------------- session discovery
+
+pid_matches() {
+  local pid=$1 start=${2:-} state actual
+  # State and start time from /proc/<pid>/stat (fields 3 and 22, counted after the command name). A zombie is gone,
+  # and a different start time is a reused pid.
+  IFS=' ' read -r state actual < <(sed -E 's/^.*\) //' "/proc/$pid/stat" 2>/dev/null | awk '{ print $1, $20 }') || return 1
+  [[ -n $state && $state != Z && $state != X ]] || return 1
+  [[ -z $start || $actual == "$start" ]]
+}
+
+history_file() {
+  local account=$1 cwd=$2 id=$3 slug candidate
+  slug=$(sed -E 's/[^A-Za-z0-9]/-/g' <<<"$cwd")
+  candidate="$account/projects/$slug/$id.jsonl"
+  if [[ -f $candidate ]]; then printf '%s\n' "$candidate"; return 0; fi
+  for candidate in "$account"/projects/*/"$id.jsonl"; do
+    if [[ -f $candidate ]]; then printf '%s\n' "$candidate"; return 0; fi
+  done
+  return 1
+}
+
+# ok, or limit when the last answer of this process is the usage-limit error and the account is still out.
+classify_session() {
+  jq -r --argjson started "${2:-0}" --argjson now "$(now)" '
+    ((.timestamp // "") | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch 0) as $at
+    | if .limit != true then "ok"
+      elif $at <= ($started / 1000) then "ok"
+      elif .resets_at != null then (if .resets_at <= $now then "ok" else "limit" end)
+      elif $at < ($now - 8 * 86400) then "ok"
+      else "limit" end' <<<"$1"
+}
+
+# The directory the watch is limited to (empty: every directory).
+watch_root() {
+  local root
+  root=$(cat -- "$STATE/root" 2>/dev/null || true)
+  printf '%s\n' "${root%/}"
+}
+
+# One JSON line per live interactive session in every account (below the root when one is set).
+scan_sessions() {
+  local account file pid id cwd kind updated started history probe state root
+  root=$(watch_root)
+  while IFS= read -r account; do
+    [[ -n $account ]] || continue
+    for file in "$account"/sessions/*.json; do
+      [[ -f $file ]] || continue
+      IFS=$'\t' read -r pid id cwd kind updated started < <(jq -r '[.pid, .sessionId, .cwd, .kind, (.updatedAt // 0), (.startedAt // 0)] | @tsv' "$file" 2>/dev/null) || continue
+      [[ $pid =~ ^[0-9]+$ && -n $id && $kind == interactive ]] || continue
+      [[ -z $root || $cwd == "$root" || $cwd == "$root"/* ]] || continue
+      pid_matches "$pid" "$(jq -r '.procStart // empty' "$file" 2>/dev/null)" || continue
+      history=$(history_file "$account" "$cwd" "$id") || continue
+      probe=$(python3 -I "$PROBE" "$history" 2>/dev/null) || continue
+      state=$(classify_session "$probe" "$started")
+      jq -cn --arg account "$account" --argjson pid "$pid" --arg id "$id" --arg cwd "$cwd" --arg history "$history" \
+        --arg state "$state" --argjson updated "$updated" --argjson started "$started" --argjson probe "$probe" \
+        '{account:$account, pid:$pid, id:$id, cwd:$cwd, history:$history, state:$state, updated:$updated, started:$started, probe:$probe}'
+    done
+  done < <(accounts_list)
+}
+
+already_taken() { sessions_json | jq -e --arg id "$1" 'any(.[]; .original == $id)' >/dev/null; }
+
+# The --only filter selects sessions by id prefix; the clones of a selected session are selected too (the chain).
+in_scope() {
+  local current=$1 depth=0 token
+  [[ -s $STATE/only ]] || return 0
+  while ((depth++ < 20)); do
+    while IFS= read -r token; do
+      [[ -n $token && $current == "$token"* ]] && return 0
+    done <"$STATE/only"
+    current=$(sessions_json | jq -r --arg id "$current" '[.[] | select(.clone == $id) | .original][0] // empty')
+    [[ -n $current ]] || return 1
+  done
+  return 1
+}
+
+# ---------------------------------------------------------------- takeover
+
+account_label() { printf '~/%s\n' "${1#"$HOME"/}"; }
+
+takeover_message() {
+  local from=$1 to=$2 text=$3 context=''
+  [[ ! -s $STATE/context ]] || context=$(cat -- "$STATE/context")
+  printf 'This session is a fork resumed on account %s because account %s hit its usage limit (error received: "%s").\n' \
+    "$(account_label "$to")" "$(account_label "$from")" "$text"
+  printf 'You are a copy of the previous session, which was closed. The builders, subagents, background tasks and messages between sessions of the old session did not come along. Before relaunching anything, check the real state: git, worktrees, processes and logs.\n'
+  printf "Continue where it stopped, following the owner's orders in the conversation.\n"
+  [[ -z $context ]] || printf 'Owner context: %s\n' "$context"
+}
+
+close_process() {
+  local pid=$1 start=${2:-} waited=0
+  kill -TERM "$pid" 2>/dev/null || true
+  while pid_matches "$pid" "$start" && ((waited < 30)); do
+    sleep 1
+    waited=$((waited + 1))
+  done
+  if pid_matches "$pid" "$start"; then
+    log "process $pid did not exit in 30 s; sending KILL"
+    kill -KILL "$pid" 2>/dev/null || true
+    sleep 1
+  fi
+  ! pid_matches "$pid" "$start"
+}
+
+copy_history() {
+  local history=$1 target=$2 id=$3 source_dir folder
+  source_dir=$(dirname -- "$history")
+  folder="$target/projects/$(basename -- "$source_dir")"
+  mkdir -p -- "$folder"
+  cp -a -- "$history" "$folder/$id.jsonl.partial"
+  mv -f -- "$folder/$id.jsonl.partial" "$folder/$id.jsonl"
+  if [[ -d $source_dir/$id ]]; then
+    mkdir -p -- "$folder/$id"
+    cp -a -- "$source_dir/$id/." "$folder/$id/"
+  fi
+  cmp -s -- "$history" "$folder/$id.jsonl"
+}
+
+# Session id and pid of the claude process that runs in the tmux window.
+discover_clone() {
+  local target=$1 window_id=$2 original=$3 wait_seconds=${4:-${UDARNIK_CLONE_WAIT_SECONDS:-90}} deadline pane pid file id
+  deadline=$((SECONDS + wait_seconds))
+  while :; do
+    [[ $(window_state "$window_id") == alive ]] || return 1
+    pane=$(window_pane_pid "$window_id")
+    if [[ -n $pane ]]; then
+      for pid in $(descendants "$pane"); do
+        file="$target/sessions/$pid.json"
+        [[ -f $file ]] || continue
+        id=$(jq -r '.sessionId // empty' "$file" 2>/dev/null) || continue
+        if [[ -n $id && $id != "$original" ]]; then printf '%s %s\n' "$id" "$pid"; return 0; fi
+      done
+    fi
+    ((SECONDS < deadline)) || return 1
+    sleep 1
+  done
+}
+
+start_clone() {
+  local original=$1 cwd=$2 target=$3 model=$4 effort=$5 permission=$6 message=$7 directory launcher name window_id
+  directory="$STATE/clones/${original:0:8}-$(now)"
+  mkdir -p -- "$directory"
+  printf '%s\n' "$message" >"$directory/message"
+  launcher="$directory/launch.sh"
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf 'cd %q || exit 1\n' "$cwd"
+    # The command word is written as is and resolved by the tmux server's PATH: it may be a wrapper that confines the
+    # network, so it is never replaced by an absolute path.
+    printf 'exec %s %q --resume %q --fork-session' "$(account_env "$target")" "$CLAUDE_COMMAND" "$original"
+    [[ -z $model ]] || printf ' --model %q' "$model"
+    [[ -z $effort ]] || printf ' --effort %q' "$effort"
+    [[ -z $permission ]] || printf ' --permission-mode %q' "$permission"
+    printf ' "$(cat %q)"\n' "$directory/message"
+  } >"$launcher"
+  name="c-${original:0:8}"
+  if tmux_cmd has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    tmux_cmd set-option -g remain-on-exit on
+    window_id=$(tmux_cmd new-window -d -P -F '#{window_id}' -t "$TMUX_SESSION:" -n "$name" -c "$cwd" "bash $(printf '%q' "$launcher")")
+  else
+    # The tmux server gets its own scope, so stopping the service unit never ends a clone (only stop --all does).
+    local -a scope=()
+    [[ ${UDARNIK_CLONE_SCOPE:-on} == off ]] || scope=(systemd-run --user --scope --quiet --collect --unit="$UNIT-clones-$(now)")
+    window_id=$("${scope[@]}" tmux -L "$TMUX_SOCKET" new-session -d -P -F '#{window_id}' -s "$TMUX_SESSION" -n "$name" -c "$cwd" -x 200 -y 50 "bash $(printf '%q' "$launcher")" \; set-option -g remain-on-exit on)
+  fi
+  printf '%s %s\n' "$window_id" "$name"
+}
+
+# Takes one limited session over. $1 is the scan line (JSON).
+model_pattern='^[][A-Za-z0-9._:-]+$'
+take_over() {
+  local line=$1 account pid id cwd history probe text hint model effort permission target
+  account=$(jq -r '.account' <<<"$line"); pid=$(jq -r '.pid' <<<"$line"); id=$(jq -r '.id' <<<"$line")
+  cwd=$(jq -r '.cwd' <<<"$line"); history=$(jq -r '.history' <<<"$line"); probe=$(jq -c '.probe' <<<"$line")
+  text=$(jq -r '.text // ""' <<<"$probe"); hint=$(jq -r '.resets_at // empty' <<<"$probe")
+  model=$(jq -r '.model // empty' <<<"$probe"); effort=$(jq -r '.effort // empty' <<<"$probe")
+  permission=$(jq -r '.permission_mode // empty' <<<"$probe")
+  account_mark_out "$account" "$text" "$hint" >/dev/null
+  if ! target=$(account_pick "$account"); then
+    log "session ${id:0:8}: account $(account_key "$account") hit its limit and no other account is available; trying again next round"
+    return 0
+  fi
+  [[ -d $cwd ]] || { log "session ${id:0:8}: folder $cwd no longer exists; nothing was done"; return 0; }
+  command -v "$CLAUDE_COMMAND" >/dev/null 2>&1 || { log "session ${id:0:8}: command $CLAUDE_COMMAND is not in the service PATH; nothing was done"; return 0; }
+  [[ -z $effort ]] || [[ $effort =~ ^(low|medium|high|xhigh|max)$ ]] || effort=''
+  [[ -z $model ]] || [[ $model =~ $model_pattern ]] || model=''
+  [[ -n $effort ]] || log "session ${id:0:8}: the history records no effort; the clone uses the account default"
+  log "session ${id:0:8}: $(account_key "$account") at its limit; taking over on $(account_key "$target") (model ${model:-default}, effort ${effort:-default}, permission ${permission:-default})"
+
+  # 1. close the original so its history is complete and nothing writes to it while it is copied.
+  if ! close_process "$pid" "$(jq -r '.procStart // empty' "$account/sessions/$pid.json" 2>/dev/null)"; then
+    log "session ${id:0:8}: process $pid did not end; nothing was copied"
+    return 0
+  fi
+  log "session ${id:0:8}: process $pid ended"
+  # 2. copy the history and the session folder (subagents, tool results) to the account that has quota.
+  if ! copy_history "$history" "$target" "$id"; then
+    log "ATTENTION session ${id:0:8}: copying the history to $(account_key "$target") failed; resume by hand with: cd $cwd && claude --resume $id"
+    return 0
+  fi
+  # 3. start the fork in the single tmux server of the service.
+  local started_window window_id name clone_id clone_pid pair
+  started_window=$(start_clone "$id" "$cwd" "$target" "$model" "$effort" "$permission" "$(takeover_message "$account" "$target" "$text")") || {
+    log "ATTENTION session ${id:0:8}: the clone did not start in tmux; resume by hand with: cd $cwd && claude --resume $id"
+    return 0
+  }
+  window_id=${started_window%% *}; name=${started_window#* }
+  # 4. learn the clone's session id so it is watched like any other session.
+  clone_id=''; clone_pid=''
+  if pair=$(discover_clone "$target" "$window_id" "$id"); then
+    clone_id=${pair%% *}; clone_pid=${pair#* }
+    log "session ${id:0:8}: clone ${clone_id:0:8} on $(account_key "$target"), window $name (pid $clone_pid)"
+  else
+    log "ATTENTION session ${id:0:8}: the clone started in window $name but did not register its session; check with: $(attach_command)"
+  fi
+  sessions_rewrite '. + [$record]' --argjson record "$(jq -cn --arg original "$id" --arg from "$account" --arg clone "$clone_id" \
+    --arg to "$target" --arg window "$name" --arg window_id "$window_id" --arg cwd "$cwd" --argjson at "$(now)" \
+    '{original:$original, from:$from, clone:$clone, to:$to, window:$window, window_id:$window_id, cwd:$cwd, at:$at, state:"running"}')"
+}
+
+# Marks clones whose window ended (logging the tail of their screen) and learns the id of late ones.
+refresh_clones() {
+  local record window_id state clone to original screen pair
+  [[ -s $STATE/sessions.json ]] || return 0
+  while IFS= read -r record; do
+    [[ -n $record ]] || continue
+    window_id=$(jq -r '.window_id' <<<"$record"); clone=$(jq -r '.clone' <<<"$record")
+    to=$(jq -r '.to' <<<"$record"); original=$(jq -r '.original' <<<"$record")
+    state=$(window_state "$window_id")
+    if [[ $state != alive ]]; then
+      if [[ $state == dead ]]; then
+        screen=$(tmux_cmd capture-pane -p -t "$window_id" 2>/dev/null | sed '/^[[:space:]]*$/d' | tail -n 8 | tr -s '[:space:]' ' ' || true)
+        tmux_cmd kill-window -t "$window_id" 2>/dev/null || true
+        log "clone of ${original:0:8} (window $(jq -r '.window' <<<"$record")) finished. End of screen: ${screen:0:300}"
+      else
+        log "clone of ${original:0:8} (window $(jq -r '.window' <<<"$record")) no longer exists"
+      fi
+      sessions_rewrite 'map(if .window_id == $w and .state == "running" then .state = "ended" else . end)' --arg w "$window_id"
+    else
+      answer_prompt "$record"
+      if [[ -z $clone ]] && pair=$(discover_clone "$to" "$window_id" "$original" 1); then
+        sessions_rewrite 'map(if .window_id == $w then .clone = $c else . end)' --arg w "$window_id" --arg c "${pair%% *}"
+        log "clone of ${original:0:8} registered as ${pair%% *}"
+      fi
+    fi
+  done < <(sessions_json | jq -c '.[] | select(.state == "running")')
+}
+
+# A clone runs under the settings of its new account, and nobody looks at its window. A permission dialog for an ask
+# rule that the original account neither asks nor denies exists only because of the move, so it is answered Yes (the
+# default option); any other dialog, or one whose original settings cannot be read, is logged once with ATTENTION for
+# the owner.
+answer_prompt() {
+  local record=$1 window_id from original marker screen rule seen
+  window_id=$(jq -r '.window_id' <<<"$record"); from=$(jq -r '.from' <<<"$record"); original=$(jq -r '.original' <<<"$record")
+  marker="$STATE/clones/${original:0:8}.prompt"
+  screen=$(tmux_cmd capture-pane -p -t "$window_id" 2>/dev/null | sed '/^[[:space:]]*$/d' | tail -n 20 || true)
+  if ! grep -q 'Esc to cancel' <<<"$screen" || ! grep -qE '^ *[^ 0-9] 1\. Yes' <<<"$screen"; then
+    rm -f -- "$marker"
+    return 0
+  fi
+  rule=$(sed -nE 's/.*Permission rule (.+) requires confirmation.*/\1/p' <<<"$screen" | head -n 1)
+  if [[ -n $rule ]] && jq -e --arg rule "$rule" 'any((.permissions.ask, .permissions.deny)[]?; . == $rule) | not' "$from/settings.json" >/dev/null 2>&1; then
+    tmux_cmd send-keys -t "$window_id" Enter
+    log "clone of ${original:0:8}: confirmation of $rule approved (account $(account_key "$from") of the original session does not ask for it)"
+    return 0
+  fi
+  seen=$(md5sum <<<"$screen" | cut -c1-12)
+  [[ $(cat -- "$marker" 2>/dev/null) != "$seen" ]] || return 0
+  mkdir -p -- "$STATE/clones"
+  printf '%s' "$seen" >"$marker"
+  log "ATTENTION clone of ${original:0:8} (window $(jq -r '.window' <<<"$record")) is waiting for a confirmation${rule:+ of $rule}; answer it in: $(attach_command)"
+}
+
+live_clones() {
+  local record count=0
+  while IFS= read -r record; do
+    [[ -n $record ]] || continue
+    [[ $(window_state "$(jq -r '.window_id' <<<"$record")") == alive ]] && count=$((count + 1))
+  done < <(sessions_json | jq -c '.[] | select(.state == "running")')
+  printf '%s\n' "$count"
+}
+
+serve_once() {
+  local line id state watched=0 limited=0 summary
+  [[ ${UDARNIK_LINKS:-on} == off ]] || ensure_shared_links
+  refresh_clones
+  udarnik_enabled || return 0
+  while IFS= read -r line; do
+    [[ -n $line ]] || continue
+    id=$(jq -r '.id' <<<"$line"); state=$(jq -r '.state' <<<"$line")
+    already_taken "$id" && continue
+    in_scope "$id" || continue
+    watched=$((watched + 1))
+    [[ $state == limit ]] || continue
+    limited=$((limited + 1))
+    take_over "$line"
+  done < <(scan_sessions)
+  summary="$watched sessions watched, $limited at the limit, $(live_clones) live clones"
+  if [[ $summary != "${LAST_SUMMARY:-}" ]]; then
+    LAST_SUMMARY=$summary
+    log "round: $summary"
+  fi
+}
+
+cmd_serve() {
+  local once=false wake_pid=''
+  [[ ${1:-} == --once ]] && once=true
+  export UDARNIK_LOG_STDOUT=1
+  mkdir -p -- "$STATE/accounts" "$STATE/clones"
+  # TERM (systemctl stop) and USR1 (a new switch or filter) both interrupt the wait at once.
+  trap 'log "service received TERM; leaving"; exit 0' TERM
+  trap ':' USR1
+  log "service started (round every ${POLL_SECONDS}s)"
+  while :; do
+    serve_once || log "the round failed (status $?); trying again next round"
+    $once && break
+    if ! udarnik_enabled && (($(live_clones) == 0)); then
+      log "switch off and no live clone; service leaving"
+      break
+    fi
+    sleep "$POLL_SECONDS" &
+    wake_pid=$!
+    wait "$wake_pid" 2>/dev/null || true
+    kill "$wake_pid" 2>/dev/null || true
+  done
+}
+
+# ---------------------------------------------------------------- viewing
+
+attach_command() { printf 'tmux -L %s attach -t %s\n' "$TMUX_SOCKET" "$TMUX_SESSION"; }
+
+view_hint() { printf 'To see the sessions: udarnik view (or %s)\n' "$(attach_command)"; }
+
+# The windows of the clones' tmux server and the Claude session each one runs, so the owner knows where to look.
+windows_json() {
+  local listing window_id name dead pane pid account session
+  listing=$(tmux_cmd list-windows -t "$TMUX_SESSION" -F $'#{window_id}\t#{window_name}\t#{pane_dead}\t#{pane_pid}' 2>/dev/null) || listing=''
+  while IFS=$'\t' read -r window_id name dead pane; do
+    [[ -n $window_id ]] || continue
+    session=''
+    if [[ $dead == 0 && -n $pane ]]; then
+      for pid in $(descendants "$pane"); do
+        for account in $(accounts_list); do
+          session=$(jq -r '.sessionId // empty' "$account/sessions/$pid.json" 2>/dev/null) || session=''
+          [[ -z $session ]] || break 2
+        done
+      done
+    fi
+    jq -cn --arg id "$window_id" --arg name "$name" --arg dead "$dead" --arg session "$session" \
+      '{id:$id, name:$name, alive:($dead == "0"), session:(if $session == "" then null else $session end)}'
+  done <<<"$listing" | jq -sc '.'
+}
+
+# Opens a terminal attached to the clones' tmux server: UDARNIK_TERMINAL (a command prefix), else xdg-terminal-exec,
+# else x-terminal-emulator. Fails when there is none.
+open_terminal() {
+  local -a prefix=()
+  if [[ -n ${UDARNIK_TERMINAL:-} ]]; then
+    IFS=$' \t' read -ra prefix <<<"$UDARNIK_TERMINAL"
+  elif command -v xdg-terminal-exec >/dev/null 2>&1; then
+    prefix=(xdg-terminal-exec)
+  elif command -v x-terminal-emulator >/dev/null 2>&1; then
+    prefix=(x-terminal-emulator -e)
+  fi
+  ((${#prefix[@]})) && command -v "${prefix[0]}" >/dev/null 2>&1 || return 1
+  setsid -f "${prefix[@]}" tmux -L "$TMUX_SOCKET" attach -t "$TMUX_SESSION" </dev/null >/dev/null 2>&1
+}
+
+# Opens a terminal on the window that runs WINDOW (a window name or id, or the start of a session id). Without a
+# display, without a terminal, or with --print, it only prints the command.
+cmd_view() {
+  local print=false wanted='' target
+  while (($#)); do
+    case "$1" in
+      --print) print=true ;;
+      -*) die "unknown view option: $1" ;;
+      *) wanted=$1 ;;
+    esac
+    shift
+  done
+  if ! tmux_cmd has-session -t "$TMUX_SESSION" 2>/dev/null; then
+    note "No session in the udarnik tmux right now; nothing to see."
+    return 0
+  fi
+  if [[ -n $wanted ]]; then
+    target=$(windows_json | jq -r --arg w "$wanted" \
+      '[.[] | select(.name == $w or .id == $w or ((.session // "") | startswith($w)))][0].id // empty')
+    [[ -n $target ]] || die "no udarnik window matches $wanted; see: udarnik status"
+    tmux_cmd select-window -t "$target"
+  fi
+  if ! $print && [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]] && open_terminal; then
+    note "Opened a terminal on the udarnik tmux. Switch window: Ctrl+b w. Leave without ending anything: Ctrl+b d or close the terminal."
+  else
+    note "To see: $(attach_command)"
+  fi
+}
+
+# ---------------------------------------------------------------- status
+
+# Live headless claude processes (-p / --print) and the account each one runs on. When /proc hides a process
+# (non-dumpable), its account and folder are null instead of an error.
+worker_processes() {
+  local pid comm cmdline argv0 exe environ account cwd
+  while IFS=' ' read -r pid comm; do
+    [[ $pid =~ ^[0-9]+$ ]] || continue
+    [[ $comm == claude || $comm =~ ^[0-9]+(\.[0-9]+)+$ ]] || continue
+    cmdline=$(tr '\0' '\n' 2>/dev/null <"/proc/$pid/cmdline") || continue
+    grep -qxE -- '-p|--print' <<<"$cmdline" || continue
+    if [[ $comm != claude ]]; then
+      argv0=$(head -n 1 <<<"$cmdline")
+      exe=$(readlink "/proc/$pid/exe" 2>/dev/null || true)
+      [[ $argv0 == */claude/versions/* || $exe == */claude/versions/* ]] || continue
+    fi
+    account=''
+    if environ=$(tr '\0' '\n' 2>/dev/null <"/proc/$pid/environ"); then
+      account=$(sed -n 's/^CLAUDE_CONFIG_DIR=//p' <<<"$environ" | head -n 1)
+      account=${account:-$HOME/.claude}
+      account=${account%/}
+    fi
+    cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+    jq -cn --argjson pid "$pid" --arg account "$account" --arg cwd "$cwd" \
+      '{pid:$pid, account:(if $account == "" then null else $account end), cwd:(if $cwd == "" then null else $cwd end)}'
+  done < <(ps -eo pid=,comm= | sed -E 's/^[[:space:]]+//')
+}
+
+status_json() {
+  local active=false enabled=false accounts='[]' sessions clones='[]' workers tail_lines context only='[]' windows root
+  local account key until percent cache age record alive
+  service_active && active=true
+  udarnik_enabled && enabled=true
+  while IFS= read -r account; do
+    [[ -n $account ]] || continue
+    key=$(account_key "$account"); until=$(account_out_until "$account"); percent=$(account_weekly_percent "$account")
+    cache=$(_usage_cache_file "$account")
+    age=''
+    [[ -f $cache ]] && age=$(( $(now) - $(stat -c %Y -- "$cache") ))
+    accounts=$(jq -c --arg path "$account" --arg key "$key" --argjson until "$until" --arg percent "$percent" --arg age "$age" \
+      --argjson now "$(now)" '. + [{key:$key, path:$path, available:($until <= $now),
+        out_until:(if $until > $now then $until else null end),
+        out_until_local:(if $until > $now then ($until | strflocaltime("%d/%m %H:%M")) else null end),
+        weekly_percent:(if $percent == "" then null else ($percent | tonumber) end),
+        cache_age_seconds:(if $age == "" then null else ($age | tonumber) end)}]' <<<"$accounts")
+  done < <(accounts_list)
+  sessions=$(scan_sessions | jq -sc --argjson now "$(now)" 'map({pid, id, short:.id[0:8], account, cwd,
+    title:(.probe.title // ""), state,
+    stopped_seconds:(if .state == "limit"
+      then ($now - ((.probe.timestamp // "") | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch $now))
+      else ($now - ((.updated // 0) / 1000 | floor)) end)})')
+  while IFS= read -r record; do
+    [[ -n $record ]] || continue
+    alive=false
+    [[ $(window_state "$(jq -r '.window_id' <<<"$record")") == alive ]] && alive=true
+    clones=$(jq -c --argjson record "$record" --argjson alive "$alive" \
+      '. + [$record + {alive:$alive, at_local:($record.at | strflocaltime("%d/%m %H:%M"))}]' <<<"$clones")
+  done < <(sessions_json | jq -c '.[] | select(.state == "running")')
+  workers=$(worker_processes | jq -sc '.')
+  windows=$(windows_json)
+  tail_lines=$(tail -n 10 -- "$STATE/udarnik.log" 2>/dev/null | jq -Rsc 'split("\n") | map(select(length > 0))')
+  context=$(cat -- "$STATE/context" 2>/dev/null || true)
+  root=$(watch_root)
+  [[ ! -f $STATE/only ]] || only=$(jq -Rsc 'split("\n") | map(select(length > 0))' <"$STATE/only")
+  jq -cn --argjson active "$active" --argjson enabled "$enabled" --arg unit "$UNIT" --arg context "$context" --argjson only "$only" \
+    --argjson accounts "$accounts" --argjson sessions "$sessions" --argjson clones "$clones" --argjson workers "$workers" \
+    --argjson log "$tail_lines" --arg root "$root" --argjson windows "$windows" --arg attach "$(attach_command)" \
+    '{service:{unit:$unit, active:$active}, enabled:$enabled, context:$context, only:$only,
+      root:(if $root == "" then null else $root end), accounts:$accounts,
+      sessions:$sessions, clones:$clones, workers:$workers,
+      view:{open:"udarnik view", attach:$attach, windows:$windows}, log:$log}'
+}
+
+cmd_status() {
+  local json=false data
+  case "${1:-}" in
+    '') ;;
+    --json) json=true ;;
+    *) die "unknown status option: $1" ;;
+  esac
+  data=$(status_json)
+  if $json; then printf '%s\n' "$data"; return 0; fi
+  printf 'Service %s: %s · switch: %s\n' "$UNIT" "$(jq -r 'if .service.active then "active" else "stopped" end' <<<"$data")" \
+    "$(jq -r 'if .enabled then "on" else "off" end' <<<"$data")"
+  jq -r 'if (.only | length) > 0 then "Only: " + (.only | join(", ")) else empty end,
+    if .root != null then "Root: " + .root else empty end,
+    if .context != "" then "Context: " + .context else empty end' <<<"$data"
+  printf '\nAccounts\n'
+  jq -r '.accounts[] | "  \(.key): " + (if .available then "available" else "out until \(.out_until_local)" end)
+    + (if .weekly_percent != null then " · weekly \(.weekly_percent)%" else "" end)' <<<"$data"
+  printf '\nWatched sessions\n'
+  jq -r '.sessions[] | "  \(.pid)  \(.short)  \(.account | split("/") | last | ltrimstr("."))  \(.state)  \(.stopped_seconds)s  \(.title)"' <<<"$data"
+  printf '\nClones\n'
+  jq -r '.clones[] | "  \(.original[0:8]) -> \((.clone // "")[0:8])  \(.to | split("/") | last | ltrimstr("."))  window \(.window)  \(if .alive then "alive" else "stopped" end)  since \(.at_local)"' <<<"$data"
+  printf '\ntmux windows\n'
+  jq -r '.view.windows[] | "  \(.id)  \(.name)  \(if .alive then "alive" else "stopped" end)" + (if .session then "  session \(.session[0:8])" else "" end)' <<<"$data"
+  printf '\nWorkers (headless claude)\n'
+  jq -r '.workers[] | "  pid \(.pid)  account \(if .account then (.account | split("/") | last | ltrimstr(".")) else "unknown" end)  \(.cwd // "")"' <<<"$data"
+  printf '\nLast log lines\n'
+  jq -r '.log[] | "  " + .' <<<"$data"
+  printf '\n%s\n' "$(view_hint)"
+}
+
+command=${1:-}
+(($#)) && shift
+case "$command" in
+  start) cmd_start "$@" ;;
+  status) cmd_status "$@" ;;
+  stop) cmd_stop "$@" ;;
+  view) cmd_view "$@" ;;
+  account) cmd_account "$@" ;;
+  _serve) cmd_serve "$@" ;;
+  help|-h|--help|'') usage ;;
+  *) usage >&2; die "unknown command: $command" ;;
+esac
