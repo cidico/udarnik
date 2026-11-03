@@ -1,185 +1,240 @@
 # udarnik
 
-When one of your Claude Code accounts hits its usage limit, the next account takes the shift. udarnik watches your
-interactive Claude Code sessions; when the last answer of one is the usage-limit error, it closes that process,
-copies its history to an account that still has quota and resumes a fork of it there, in a window of a private
-tmux server. The clone is watched too, so it chains from account to account. A skill, `/takeover`, drives it from
-inside Claude Code.
+**When a Claude account runs out of quota, your session carries on with another one.**
+
+udarnik is a helper for people who use [Claude Code](https://claude.com/claude-code) with more than one Claude
+account, and sometimes on more than one machine. It watches your sessions. When the account of a session hits its
+usage limit, udarnik closes that session and continues the same conversation on an account that still has quota.
 
 The name: an *udarnik* was a Soviet "shock worker", the one who never stopped working. Here the next account takes
 the shift.
 
-## Requirements
+## At a glance
+
+| | |
+|---|---|
+| **What it does** | Moves a Claude Code conversation to another account (or another machine) when its account is out of quota. |
+| **When you need it** | You have two or more Claude accounts, and long sessions that must not stop in the middle of the work. |
+| **How you use it** | Type `/takeover` inside Claude Code, or run `udarnik start` in a terminal. |
+| **What else it does** | Gives scripts a safe way to pick an account and wait for quota. Brings back a session whose process died. Shows one board for all accounts, sessions and machines. Stops everything with one command. |
+| **Technical details** | [docs/REFERENCE.md](docs/REFERENCE.md) |
+
+## The problem
+
+You start a long task in Claude Code. An hour later the account reaches its usage limit and the session stops in the
+middle of the work. You have another account with quota, but moving the conversation there by hand is slow: find the
+history, copy it, resume it, explain what happened.
+
+udarnik does those steps for you, and it keeps doing them for as long as there is an account with quota.
+
+## How it works
+
+You turn udarnik on once. A small background service then looks at your sessions every two minutes. For each
+session, it reads the end of the conversation. If the last thing Claude said is the "usage limit reached" error, the
+service takes over:
+
+1. It notes that the account is out of quota until the time in the error.
+2. It picks the next account that has quota.
+3. It closes the stopped session, so its history is complete.
+4. It copies the history to the new account.
+5. It resumes the conversation there, as a fork, in a window of a private tmux (a terminal multiplexer: it keeps
+   terminal windows alive in the background). The new session gets a message that says why it exists and to check
+   the real state before it relaunches anything.
+6. It watches the new session too. If this account runs out as well, the chain goes on.
+
+```mermaid
+sequenceDiagram
+    participant You
+    participant A as Account A
+    participant U as udarnik
+    participant B as Account B
+    You->>A: work in a Claude Code session
+    A-->>You: usage limit reached
+    U->>A: sees the limit error (every 2 minutes)
+    U->>A: closes the stopped session
+    U->>B: copies the conversation history
+    U->>B: resumes it as a fork, with a note
+    You->>B: attach to the window and keep working
+```
+
+The resumed session lives in a tmux window. You do not have to watch it: it works on its own. When you want to see
+it, `udarnik view` opens a terminal on it.
+
+> [!NOTE]
+> The resumed session is a **fork**: a new session that starts with the whole conversation of the old one. The old
+> session stays in the history of its account, untouched.
+
+## What you need
 
 - Linux with a systemd user manager (`systemctl --user` works), `tmux`, `jq`, `python3`, `flock` (util-linux),
-  `setsid`, `systemd-run`, bash 4 or newer.
-- Claude Code, and two or more account config dirs on the same machine: `~/.claude` and `~/.claude-*`, each with
-  its own `.credentials.json` (log in to each with `CLAUDE_CONFIG_DIR=~/.claude-work claude`).
+  `setsid`, `systemd-run`, `tar`, bash 4 or newer.
+- Claude Code with two or more accounts on the same machine: `~/.claude` and `~/.claude-*`, each with its own
+  login. Log in to each one with `CLAUDE_CONFIG_DIR=~/.claude-work claude`, and open it once, interactively.
+- For several machines: `ssh` with keys between them (no password prompts).
 
-## Install, update, uninstall
+## Install
 
 ```
 ./install.sh              # install or update
-./install.sh --force      # also replace a skills/takeover or a ~/.local/bin/udarnik that udarnik does not own
 ./install.sh --uninstall  # remove what install.sh installed
 ```
 
-`install.sh` checks the requirements, copies `bin`, `lib` and `skills` to `~/.local/share/udarnik` (a fresh copy
-through a staging folder and a rename), links `~/.local/bin/udarnik` to it, and installs the `/takeover` skill:
+The installer copies udarnik to `~/.local/share/udarnik`, puts the `udarnik` command in `~/.local/bin` and installs
+the `/takeover` skill for every account. It never restarts a running service. The options and the details are in the
+[reference](docs/REFERENCE.md#install-update-uninstall).
 
-- if a shared folder exists (`~/.claude-shared`, see `UDARNIK_SHARED_DIR`), the skill goes to
-  `<shared>/skills/takeover` and every account gets a symlink to it;
-- otherwise the skill is copied into `<account>/skills/takeover` for every account.
+## Everyday use
 
-A skill folder that udarnik owns carries a `.udarnik` marker file. A `skills/takeover` without the marker (a real
-folder or a foreign symlink) is never touched unless `--force`; the skipped paths are printed.
+Each thing below has two ways: type the `/takeover` command inside Claude Code, or run the `udarnik` command in a
+terminal. Both do the same.
 
-The installer never restarts the service. When it is running, it keeps the old version until
-`udarnik stop --all` and `udarnik start`. `--uninstall` runs `udarnik stop` (never `--all`) only if the service is
-active, removes the command link, the installed tree and the marked skill folders and links, and keeps the state
-directory (it prints where it is).
-
-## Commands
-
-| Command | What it does |
-|---|---|
-| `udarnik start [--context TEXT] [--only ID,ID] [--root DIR]` | Turn the takeover on and start the service (one transient systemd user unit). `--context` is a note added to the message the clone receives. `--only` limits the takeover to sessions whose id starts with one of the prefixes (their clones are included). `--root` limits it to sessions whose folder is DIR or below it. Each call rewrites all three; an absent option is cleared. With the service already active, `start` only updates them. |
-| `udarnik status [--json]` | Service and switch, accounts (available or out until, weekly usage), watched sessions, clones, tmux windows, workers, last log lines. `--json` is the machine form (`root` is `null` when unset). |
-| `udarnik stop [--all]` | Turn the switch off: no new takeover; the service stays only while clones live. `--all` also ends the service and every clone. |
-| `udarnik view [WINDOW\|ID] [--print]` | Open a terminal attached to the clones' tmux server, on the window with that name, window id or session id prefix. Without a display, or with `--print`, it prints the attach command. Closing the terminal only detaches. |
-| `udarnik account <sub>` | The account hook for runners, below. |
-
-`workers` in the status are live headless `claude` processes (`-p` or `--print`) with the account each one runs on
-and its folder; both are `null` when `/proc` hides the process.
-
-By default every live interactive session of every account is watched, in any directory. Times are shown in the
-system's local zone (set `TZ` to change that).
-
-## How a takeover works
-
-1. Every `UDARNIK_POLL_SECONDS` (or at once, after `start`/`stop`) the service lists the live interactive sessions
-   through `<account>/sessions/<pid>.json` and checks that each pid is the same process that wrote the file.
-2. It reads the tail of the session history. A session is at the limit when its last answer is the usage-limit
-   error, it happened while that process ran, and the account is still out (the reset time is in the error).
-3. The account is marked out until the reset. The available account with the lowest weekly usage is picked
-   (unknown usage goes last).
-4. The original process is closed (TERM, KILL after 30 seconds) so its history is complete.
-5. The history `<id>.jsonl` and the `<id>/` folder (subagents, tool results) are copied to the chosen account and
-   compared.
-6. A fork is resumed there (`claude --resume ID --fork-session`, with the same model, effort and permission mode
-   when the history records them) in a window of the tmux server `udarnik`, with a message saying that it is a
-   fork, why, that builders, subagents, background tasks and messages between sessions did not come along, to check
-   the real state before relaunching anything, and the owner's context.
-7. The clone's session id is recorded; from then on it is watched like any other session, so the chain continues.
-   When no account has quota, nothing is closed and the next round tries again.
-
-The service leaves by itself when the switch is off and no clone is alive. The tmux server runs in its own
-`systemd-run --user --scope`, so stopping the unit never kills a clone.
-
-## Safety
-
-- A clone runs under the settings of its new account and nobody looks at its window. udarnik answers Yes to a
-  permission dialog only when it exists because of the move: an ask rule that the original account neither asks nor
-  denies. Any other dialog is never answered; it is logged once as an `ATTENTION` line with the window to open.
-- Every owner-attention line in `udarnik.log` carries the keyword `ATTENTION`.
-- udarnik never makes a network call. The weekly usage is only read from a file (see below).
-- The clones survive `udarnik stop` and the end of the service; only `udarnik stop --all` ends them.
-- The clone is started with the command word `claude` (`UDARNIK_CLAUDE`), resolved through the service `PATH`
-  when the window starts, never replaced by an absolute path, so a wrapper in `PATH` keeps applying.
-- A real folder or file is never replaced when the shared memories and skills are linked (see `UDARNIK_LINKS`).
-
-## Configuration
-
-Every variable is read by the command and passed to the service by `udarnik start` (together with `PATH`, `HOME`
-and `TZ`).
-
-| Variable | Default | Meaning |
+| I want to... | In Claude Code | In a terminal |
 |---|---|---|
-| `UDARNIK_UNIT` | `udarnik` | systemd user unit name (`<name>.service`). |
-| `UDARNIK_TMUX_SOCKET` | `udarnik` | tmux socket name (`tmux -L`); the tmux session is `udarnik`. |
-| `UDARNIK_STATE` | `${XDG_STATE_HOME:-~/.local/state}/udarnik` | State directory: switch, filters, `sessions.json`, per-account `out-until`, clone launchers, `udarnik.log`, the `snapshot` the service runs from. |
-| `UDARNIK_POLL_SECONDS` | `120` | Seconds between rounds. |
-| `UDARNIK_ACCOUNTS` | `~/.claude` and `~/.claude-*` that have `.credentials.json` | Colon-separated list of account dirs. |
-| `UDARNIK_CLONE_WAIT_SECONDS` | `90` | How long to wait for a new clone to register its session. |
-| `UDARNIK_CLONE_SCOPE` | `on` | `off` starts the tmux server directly instead of in its own `systemd-run --user --scope` (tests). |
-| `UDARNIK_LINKS` | `on` | `off` disables linking the shared memories and skills into every account. |
-| `UDARNIK_SHARED_DIR` | `~/.claude-shared` | Folder of memories and skills shared by the accounts, linked into each one when it exists. Never listed as an account. |
-| `UDARNIK_USAGE_FILE` | `~/.cache/claude-statusline-usage-{key}.json` | Template of the file that holds a copy of the account's usage JSON; `{key}` is the account dir name without its leading dot. |
-| `UDARNIK_CLAUDE` | `claude` | Command word used to start a clone. |
-| `UDARNIK_TERMINAL` | (unset) | Command prefix used by `view` to open a terminal (word-split), before `xdg-terminal-exec` and `x-terminal-emulator -e`. |
-| `UDARNIK_PREFIX` | `~/.local/share/udarnik` | Read by `install.sh` only: where the tree is installed. |
+| Turn it on | `/takeover` | `udarnik start` |
+| Turn it on only for some sessions | `/takeover` and say which ones | `udarnik start --only ID,ID` or `--root DIR` |
+| Look at the board | `/takeover status` | `udarnik status` |
+| See or attach to a resumed session | `/takeover view` | `udarnik view` |
+| Turn it off (clones keep running) | `/takeover off` | `udarnik stop` |
+| Stop everything at once | tell it "stop everything" | `udarnik stop --all` |
+| Keep a session alive | `/takeover keep ID` | `udarnik keep ID` |
+| Pin a session to this machine | `/takeover pin ID` | `udarnik pin ID` |
+| Move a session to another machine | `/takeover move ID MACHINE` | `udarnik move ID --to MACHINE` |
+| Control another machine | add the machine name | add `--on MACHINE` (one) or `--fleet` (all) |
+| Let scripts change accounts | `/takeover runners on` | `udarnik runners on` |
 
-`udarnik view` opens a terminal only when `WAYLAND_DISPLAY` or `DISPLAY` is set and `--print` is not given; the
-terminal is started detached with `setsid -f`.
+`ID` is the start of a session id, as the board shows it.
 
-### The usage file
+### The board
 
-udarnik never calls `/api/oauth/usage` (on a machine where all Claude traffic must go through a proxy, a service
-outside it would leak). It only reads a copy of that JSON response from the file named by `UDARNIK_USAGE_FILE`,
-which something else keeps up to date, typically a status line script. It reads `limits[]` where
-`kind == "weekly_all"` for `percent` (to pick the account with the lowest weekly usage) and `resets_at` (when the
-error text has no readable reset). A missing file means unknown usage: that account is picked last.
+`udarnik status` shows, in one place:
 
-## Account hook for runners
+- each account: available, or out of quota until a given time, with its weekly usage;
+- the sessions udarnik watches, and which are pinned or kept;
+- the resumed sessions ("clones") and the tmux window of each one, with the command that attaches to it;
+- scripts that run Claude in the background and scripts waiting for quota.
 
-Campaign runners, schedulers or any script that calls `claude -p` can share the same switch and account state:
+### Turn it off
 
-| Command | Result |
-|---|---|
-| `udarnik account enabled` | Exit 0 if the switch is on, 1 otherwise. |
-| `udarnik account current` | The account dir for the caller's environment (`CLAUDE_CONFIG_DIR`, else `~/.claude`); when the switch is on and that account is out, the best available other one. |
-| `udarnik account limit ACCOUNT` | Reads the failure text on stdin. Exit 1 and no output if it is not a usage-limit message. Otherwise marks ACCOUNT out until the parsed reset and prints the best available other account (exit 0), or exits 75 when none is available. |
-| `udarnik account next` | Epoch at which the first account is available again (now if one already is). |
-| `udarnik account env ACCOUNT` | The env prefix that runs a command in ACCOUNT: `env -u CLAUDE_CONFIG_DIR` for `~/.claude`, else `env CLAUDE_CONFIG_DIR=...` (shell-quoted; use `eval` to run it). |
-| `udarnik account pick [EXCLUDE...]` | The available account with the lowest weekly usage. |
+`udarnik stop` stops new takeovers. The resumed sessions keep running, and the service leaves by itself when none
+is left. `udarnik stop --all` ends the service, every resumed session, the background Claude processes and the
+waiting scripts, and says what it ended.
 
-A runner that repeats a headless call on the next account when the current one is out of quota:
+> [!WARNING]
+> `udarnik stop --all` closes the resumed sessions. Use plain `udarnik stop` when you only want to stop new
+> takeovers.
 
-```bash
-failover=false account=''
-if udarnik account enabled; then
-  failover=true
-  account=$(udarnik account current)
-fi
-while :; do
-  set +e
-  (
-    if $failover; then
-      if [[ $account == "$HOME/.claude" ]]; then unset CLAUDE_CONFIG_DIR; else export CLAUDE_CONFIG_DIR=$account; fi
-    fi
-    claude -p "$prompt" >"$out" 2>"$err"
-  )
-  code=$?
-  set -e
-  (( code != 0 )) || break
-  $failover || break
-  status=0
-  next=$(cat "$out" "$err" | udarnik account limit "$account") || status=$?
-  case $status in
-    0) account=$next ;;                                   # limit hit: repeat the call on the next account
-    75) echo "no account has quota until $(date -d "@$(udarnik account next)")" >&2; exit 75 ;;
-    *) break ;;                                           # not a usage-limit failure
-  esac
-done
+### Keep a session alive
+
+Some sessions host other work, for example a session whose background agents run a whole campaign. If its process
+dies, that work is lost and the leftovers may keep running on their own. Mark the session with `udarnik keep ID`.
+While udarnik is on, it then does this:
+
+```mermaid
+flowchart TD
+    A["Kept session: its process dies"] --> B{"Was it a usage limit?"}
+    B -->|"yes"| C["Normal takeover handles it"]
+    B -->|"no"| D["udarnik stops the systemd scope of the session"]
+    D --> E["What the session left running ends with it"]
+    E --> F["udarnik resumes the same session<br/>same account, same folder"]
+    F --> G["The session gets a note that it was resumed"]
 ```
 
-## Limits
+> [!TIP]
+> To make the cleanup work, start the session in a scope of its own:
+> `systemd-run --user --scope --unit=NAME claude`. Without it, the session still comes back, but what it left
+> running is not ended. Before you close a kept session on purpose, run `udarnik unkeep ID`: closing it counts as a
+> death, and udarnik would bring it back.
 
-udarnik relies on Claude Code internals, verified with Claude Code 2.1.311: the per-process session file
-`<account>/sessions/<pid>.json`, the history `<account>/projects/<slug>/<id>.jsonl` (including the entry fields that
-mark the usage-limit error), `claude --resume ID --fork-session`, and the text of the permission dialog
-(`Permission rule ... requires confirmation`, `1. Yes`, `Esc to cancel`). A Claude Code release that changes any of
-them can stop the detection or the dialog handling; the tests use fakes and do not prove the real client.
+### Several machines
 
-A takeover does not carry over anything that lived outside the history: builders, subagents, background tasks and
-messages between sessions of the old session are gone, which is why the clone is told to check the real state.
+With a fleet file (one file that lists your machines; see the [reference](docs/REFERENCE.md#several-machines)),
+udarnik works across machines:
 
-## Tests
+- one board shows all of them (`udarnik status --fleet`);
+- an account that is out of quota on one machine is marked out on all of them;
+- when no account on a machine has quota, the session moves to another machine that has one;
+- you can move a session by hand with `udarnik move ID --to MACHINE`;
+- a session that needs its machine (for example, it works on a checkout only that machine has) stays there if you
+  pin it with `udarnik pin ID`.
 
+```mermaid
+sequenceDiagram
+    participant U1 as udarnik on machine 1
+    participant U2 as udarnik on machine 2
+    U1->>U1: session hits its limit, no account here has quota
+    U1->>U2: can you take this session? (ssh)
+    U2-->>U1: yes, the folder exists and an account has quota
+    U1->>U1: closes the session
+    U1->>U2: sends the conversation history (ssh)
+    U2->>U2: resumes it as a fork, with a note
+    U1->>U1: lists it under "Moved to other machines"
 ```
-bash tests/udarnik.sh
-```
 
-Deterministic, no network, no real account: every case uses a temporary `HOME`, a fake `claude`, fake sessions, a
-per-run tmux socket and unit name (`udarnik-test-<pid>`), `UDARNIK_CLONE_SCOPE=off`, and stubs for `systemctl` and
-`systemd-run`. It also runs `install.sh` in temporary homes.
+> [!NOTE]
+> Only the conversation moves. Changes that were not committed and pushed stay on the old machine. The new session
+> is told to check.
+
+### Scripts and background Claude processes
+
+Scripts that call `claude -p` (called "runners" here) can ask udarnik which account to use, and can wait for quota
+in a way you can see on the board and stop. This is off until you run `udarnik runners on` (or `udarnik start`).
+The commands, the exit codes and a full example are in the
+[reference](docs/REFERENCE.md#account-hook-for-runners).
+
+## Questions
+
+**Will I lose my conversation?**
+No. The whole history is copied to the new account and the conversation resumes from it. What does not come along is
+what lived outside the history: subagents, builders, background tasks and messages between sessions. The new session
+is told this and checks the real state before it relaunches anything.
+
+**What happens if every account is out of quota?**
+Nothing is closed. udarnik tries again at the next round (every two minutes by default) and acts when an account is
+back. With several machines, it first tries to move the session to a machine that has an account with quota. A
+runner script that finds every account out calls `udarnik account wait`, which waits until one is back.
+
+**How does udarnik know when an account is back?**
+From the reset time in the limit error. When the error has none, it assumes one hour. A script can also tell udarnik
+that a call worked in that account (`udarnik account clear`), which proves the account is back.
+
+**Does it touch sessions that an app like T3 Code hosts?**
+No. udarnik shows them on the board, but it never closes, clones or keeps a session an app hosts: the app owns that
+session's process and conversation, and a copy in tmux would run the same session twice. When such a session hits its
+limit, udarnik writes one line in its log and leaves it to the app (T3 Code can resume it after the reset, or you
+open it again on another account there). `udarnik stop --all` does not end them either.
+
+**Does it touch my background `claude -p` processes?**
+It never takes them over: they are "workers", only listed on the board. `udarnik stop --all` ends them.
+
+**How do I stop everything at once?**
+`udarnik stop --all`, or `udarnik stop --all --fleet` for every machine. It prints how many processes it ended, and
+exits with an error if something is still alive.
+
+**Is anything sent anywhere?**
+No. udarnik never calls an API. The only network use is ssh to the machines of your fleet file; without that file it
+uses no network at all. The weekly usage is read from a local file that something else keeps (typically a status
+line script).
+
+**Will it answer questions that Claude asks in the resumed session?**
+Only two kinds: it says "Yes, I trust this folder", and it answers Yes to a permission question that exists only
+because of the move. Any other question is not answered. It becomes a line with the word `ATTENTION` in the log,
+with the window to open.
+
+## Limits and caveats
+
+> [!WARNING]
+> udarnik relies on Claude Code internals: the session files, the history file, the way the limit error is written
+> and the text of the permission dialog. It was checked with Claude Code 2.1.311. A new Claude Code release can
+> break the detection. The tests use fakes and do not prove the real client.
+
+- A resumed session is a fork. Subagents, builders, background tasks and messages between sessions of the old session
+  are gone.
+- A resumed session only starts on an account that you opened interactively at least once on that machine.
+- Several machines need ssh keys and synchronized clocks (NTP).
+- udarnik runs on Linux with systemd.
+
+## More
+
+[docs/REFERENCE.md](docs/REFERENCE.md) holds the technical page: every command and option, every environment
+variable, the state directory, the account hook for runners, how long an account stays out, kept sessions, the fleet
+and the tests.

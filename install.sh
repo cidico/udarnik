@@ -45,7 +45,7 @@ remove_path() { if [[ -L $1 ]]; then rm -f -- "$1"; else rm -rf -- "$1"; fi; }
 check_dependencies() {
   local missing=() tool
   ((BASH_VERSINFO[0] >= 4)) || missing+=('bash >= 4')
-  for tool in jq tmux python3 flock setsid systemd-run systemctl; do
+  for tool in jq tmux python3 flock setsid systemd-run systemctl tar; do
     command -v "$tool" >/dev/null 2>&1 || missing+=("$tool")
   done
   if ((${#missing[@]})); then
@@ -160,6 +160,11 @@ do_uninstall() {
   state=$(udarnik_state_dir)
   if service_active; then
     if [[ -x $PREFIX/bin/udarnik ]]; then "$PREFIX/bin/udarnik" stop || true; else "$SOURCE_DIR/bin/udarnik" stop || true; fi
+  fi
+  # The hook for runners does not outlive the install: an install later never finds it on without the owner.
+  if [[ -d $state ]]; then
+    udarnik_set_runners off
+    say "account switching for runners turned off (udarnik runners on turns it on again after an install)"
   fi
   if [[ -L $LINK && $(readlink -- "$LINK") == "$PREFIX/bin/udarnik" ]]; then
     rm -f -- "$LINK"

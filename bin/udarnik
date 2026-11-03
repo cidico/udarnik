@@ -3,23 +3,45 @@
 #
 #   udarnik start [--context TEXT] [--only ID,ID] [--root DIR]   turn it on (one transient systemd user service)
 #   udarnik status [--json]                                       accounts, sessions, clones, workers, log
-#   udarnik stop [--all]                                          turn it off; --all also ends the clones
+#   udarnik stop [--all]                                          turn it off; --all also ends the clones, the workers
+#                                                                 and the runners waiting for quota
+#   udarnik runners on|off|status                                 the account hook for runners, on its own
 #   udarnik view [WINDOW|ID] [--print]                            open a terminal attached to the clones' tmux server
-#   udarnik account <sub>                                         account hook for runners (see README)
+#   udarnik move ID --to MACHINE                                  move a live session to another machine
+#   udarnik pin ID | unpin ID | pins                              sessions that never move to another machine
+#   udarnik keep ID | unkeep ID                                   sessions the service brings back when their process dies
+#   udarnik account <sub>                                         account hook for runners (see README); `account wait`
+#                                                                 is the wait of a runner whose every account is out
+#   start, stop, status, runners, view, move, pin, unpin, pins, keep and unkeep take --on MACHINE; start, stop, status
+#   and runners take --fleet (every machine).
 #
 # The service watches every live interactive session of every account (or only those at or below --root). When the last
 # answer of one is the usage-limit error, it closes that process, copies the history to an account with quota and
-# resumes a fork of it in a tmux window. The clone is watched like any other session, which chains the takeover.
-# This program never makes a network call.
+# resumes a fork of it in a tmux window. The clone is watched like any other session, which chains the takeover. When
+# no account here has quota, the session moves to another machine of the fleet that has one.
+# A kept session (udarnik keep) whose process dies for any other reason is resumed by the service, as the same session,
+# in its own systemd scope; the scope it died in is stopped first, which ends what it left running.
+# The only network calls are ssh to the other machines of the fleet file; none at all without that file.
 set -Eeuo pipefail
 IFS=$'\n\t'
 umask 077
+# When the command was entered, before anything else runs: the default end of the call `account clear` is told about.
+printf -v ENTERED_AT '%(%s)T' -1
+# UDARNIK_CLOCK_OFFSET (tests only): seconds the tests' clock is ahead of the real one; their `date` adds the same.
+if [[ ${UDARNIK_CLOCK_OFFSET:-} =~ ^-?[0-9]+$ ]]; then ENTERED_AT=$((ENTERED_AT + UDARNIK_CLOCK_OFFSET)); fi
 
 # Resolve symlinks (~/.local/bin/udarnik points at the installed tree).
 SCRIPT_DIR=$(cd -- "$(dirname -- "$(readlink -f -- "${BASH_SOURCE[0]}")")" && pwd -P)
 TOOL_DIR=$(cd -- "$SCRIPT_DIR/.." && pwd -P)
 # shellcheck source=../lib/accounts.sh
 source "$TOOL_DIR/lib/accounts.sh"
+
+# Reached over ssh without a login session (an sshd without PAM), the shell lacks the user's runtime folder, and
+# systemctl --user, systemd-run --user and the clones' scope cannot reach the user's manager. It is the usual one.
+if [[ -z ${XDG_RUNTIME_DIR:-} && -d /run/user/$(id -u) ]]; then export XDG_RUNTIME_DIR="/run/user/$(id -u)"; fi
+if [[ -z ${DBUS_SESSION_BUS_ADDRESS:-} && -S ${XDG_RUNTIME_DIR:-/nonexistent}/bus ]]; then
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$XDG_RUNTIME_DIR/bus"
+fi
 
 PROBE="$TOOL_DIR/lib/session_probe.py"
 STATE=$(udarnik_state_dir)
@@ -41,19 +63,51 @@ Usage: udarnik <command>
 
 Commands:
   start [--context TEXT] [--only ID,ID] [--root DIR]
-                                Turn the takeover on and start the service. Each call rewrites the three options
-                                (an absent option is cleared).
+                                Turn the takeover and the account hook for runners on and start the service. Each
+                                call rewrites the three options (an absent option is cleared).
   status [--json]               Accounts, watched sessions, clones, workers and the log
-  stop [--all]                  Turn it off (clones stay alive); --all also ends the service and the clones
+  stop [--all]                  Turn the takeover off (clones stay alive; the hook for runners stays on) and say what
+                                still runs here; --all also turns the hook off, ends the service and the clones,
+                                the workers (headless claude) and the runners waiting for quota
+  runners on|off|status         Turn the account hook for runners on or off, or say whether it is on
   view [WINDOW|ID] [--print]    Open a terminal attached to the clones' tmux (on that window); --print only prints
-  account <sub>                 Account hook for runners:
-                                  enabled            exit 0 when the switch is on, 1 otherwise
-                                  current            the account to use now (the caller's, or the best other one)
-                                  limit ACCOUNT      failure text on stdin; mark ACCOUNT out, print the next account
+  move ID --to MACHINE          Close a live session here and resume it on another machine of the fleet
+  pin ID | unpin ID | pins      Pin a session (id prefix) to this machine: it changes accounts here but never moves
+                                to another machine; its clones are pinned too. pins lists them
+  keep ID | unkeep ID           Keep a live session (id prefix): when its process dies for any reason but a usage limit
+                                (which the takeover handles), the service stops the systemd scope it ran in (what it left
+                                running dies with it) and resumes the same session in a new scope of its own, with a
+                                message. Only while the takeover is on. Listed by status
+  account <sub>                 Account hook for runners (KIND: interactive or worker, see the order in the README):
+                                  enabled            exit 0 when the hook for runners is on, 1 otherwise
+                                  current [--kind KIND]
+                                                     the account to use now (the caller's, or the next one)
+                                  limit [--kind KIND] ACCOUNT
+                                                     failure text on stdin; mark ACCOUNT out, print the next account
                                                      (exit 1: not a limit message, exit 75: no account left)
                                   next               epoch at which the first account is available again
+                                  wait [--label TEXT]
+                                                     the wait of a runner whose every account is out: returns 0 when
+                                                     an account is back, 1 at once (or when the hook is turned off
+                                                     meanwhile); shown by status, ended by stop --all
                                   env ACCOUNT        the env prefix that runs a command in ACCOUNT
-                                  pick [EXCLUDE...]  the available account with the lowest weekly usage
+                                  pick [--kind KIND] [EXCLUDE...]
+                                                     the available account to go to
+                                  list [--json]      every account: identity, login, onboarding, quota, weekly usage
+                                  clear [--at EPOCH] [--kind KIND] ACCOUNT
+                                                     a call worked in ACCOUNT (it ended at EPOCH, default now): if it
+                                                     is marked out, it is back (here and, told by ssh, on every
+                                                     machine of the fleet), unless a limit was marked after the call
+                                  learn IDENTITY KEY EPOCH [FROM [AT]]
+                                                     record that an account of another machine is out until EPOCH
+                                  learn-clear IDENTITY KEY AT FROM
+                                                     record that a call worked in an account of another machine at AT
+                                  learn-weekly IDENTITY KEY PERCENT RESETS_AT AT FROM
+                                                     record the weekly usage another machine read at AT
+
+Several machines (the "machines" of the fleet file, UDARNIK_FLEET):
+  --on MACHINE                  start, stop, status, runners, view, move, pin, unpin, pins, keep and unkeep run on that machine
+  --fleet                       start, stop, status and runners run on every machine (status: one board per machine)
 USAGE
 }
 
@@ -104,11 +158,12 @@ cmd_start() {
   tr ',' '\n' <<<"$only" | sed '/^[[:space:]]*$/d' >"$STATE/only"
   if [[ -n $root ]]; then printf '%s\n' "$root" >"$STATE/root"; else rm -f -- "$STATE/root"; fi
   : >"$STATE/enabled"
+  udarnik_set_runners on
   [[ ${UDARNIK_LINKS:-on} == off ]] || ensure_shared_links
   if service_active; then
     service_wake
     log "start: service already active; context, filter and root updated"
-    note "The service was already active; context, filter and root were updated."
+    note "The service was already active; context, filter and root were updated. Account switching for runners is on."
     note "$(view_hint)"
     return 0
   fi
@@ -119,7 +174,10 @@ cmd_start() {
   [[ :$path: == *":$HOME/.local/bin:"* ]] || path="$path:$HOME/.local/bin"
   local -a setenv=("--setenv=PATH=$path" "--setenv=HOME=$HOME" "--setenv=UDARNIK_STATE=$STATE")
   [[ -z ${TZ:-} ]] || setenv+=("--setenv=TZ=$TZ")
-  for variable in $(compgen -e | grep -E '^UDARNIK_' | grep -vx 'UDARNIK_STATE' || true); do
+  # The owner's settings (UDARNIK_ACCOUNTS, UDARNIK_FLEET, UDARNIK_TMUX_SOCKET...) go to the service as they are set
+  # here. Never the log switches (the service sets its own, and one inherited from a clone of an older service would
+  # put log lines into values) nor the tests' clock.
+  for variable in $(compgen -e | grep -E '^UDARNIK_' | grep -vxE 'UDARNIK_(STATE|LOG_[A-Z_]+|CLOCK_OFFSET)' || true); do
     setenv+=("--setenv=$variable=${!variable}")
   done
   systemd-run --user --unit="$UNIT" --collect --quiet \
@@ -127,11 +185,107 @@ cmd_start() {
     "$snapshot/bin/udarnik" _serve
   log "start: service started (only: ${only:-every session}; root: ${root:-anywhere})"
   if service_active; then
-    note "Takeover on: service $UNIT is active${only:+ (only: $only)}${root:+ (root: $root)}."
+    note "Takeover on: service $UNIT is active${only:+ (only: $only)}${root:+ (root: $root)}. Account switching for runners is on."
     note "$(view_hint)"
   else
     die "service $UNIT did not stay active; see: journalctl --user -u $UNIT"
   fi
+}
+
+# The switch of a version before the runners file covered the runners too: they keep it.
+_switch_off() {
+  [[ -f $STATE/runners || ! -f $STATE/enabled ]] || _write_runners on
+  rm -f -- "$STATE/enabled"
+}
+
+# The workers that stop --all may end: every one worker_processes lists, except this process and its ancestors (the
+# session that asked, when it is itself a headless one).
+stoppable_workers() {
+  local pid
+  while IFS= read -r pid; do
+    [[ -n $pid ]] && ! is_ancestor "$pid" || continue
+    printf '%s\n' "$pid"
+  done < <(worker_processes | jq -r '.pid')
+}
+
+# "1 worker", "2 workers": COUNT SINGULAR PLURAL.
+counted() { if (($1 == 1)); then printf '%s %s' "$1" "$2"; else printf '%s %s' "$1" "$3"; fi; }
+
+# What still runs here that `stop` leaves alone: the headless workers and the runners waiting for quota.
+report_still_running() {
+  local workers waits data back parts=''
+  workers=$(stoppable_workers | wc -l)
+  data=$(waits_json)
+  waits=$(jq 'length' <<<"$data")
+  ((workers + waits > 0)) || return 0
+  if ((workers > 0)); then parts="$(counted "$workers" worker workers) (headless claude)"; fi
+  if ((waits > 0)); then
+    back=$(jq 'map(.until) | min' <<<"$data")
+    [[ -z $parts ]] || parts+=' and '
+    parts+="$(counted "$waits" 'runner waiting for quota' 'runners waiting for quota') (back at $(local_time "$back"))"
+  fi
+  note "Still running here: $parts; \`udarnik stop\` does not stop them, \`udarnik stop --all\` does."
+}
+
+# Ends what the switches do not reach: TERM to the workers, then waits for them and for the registered waits (which
+# leave by themselves within a slice once the runners switch is off), KILL to a worker that stays, TERM to a wait that
+# stays. Says what it ended and, by pid, what is still alive (return 1). Pids are checked with their start time, so a
+# reused pid is never signalled.
+end_runners() {
+  local pid start tick ticks wait_for=${UDARNIK_STOP_WAIT:-15} workers=0 waits=0 alive=''
+  local -A running=() kind=()
+  [[ $wait_for =~ ^([0-9]+(\.[0-9]*)?|\.[0-9]+)$ ]] || wait_for=15
+  ticks=$(awk -v seconds="$wait_for" 'BEGIN { printf "%d", seconds * 5 }')
+  while IFS= read -r pid; do
+    start=$(pid_start "$pid") || continue
+    running[$pid]=$start kind[$pid]=worker
+  done < <(stoppable_workers)
+  while IFS=$'\t' read -r pid start; do
+    running[$pid]=$start kind[$pid]=wait
+  done < <(waits_registered | jq -r '[.pid, .start] | @tsv')
+  for pid in "${!running[@]}"; do
+    if [[ ${kind[$pid]} == worker ]]; then workers=$((workers + 1)); else waits=$((waits + 1)); fi
+  done
+  ((${#running[@]} > 0)) || return 0
+  for pid in "${!running[@]}"; do
+    [[ ${kind[$pid]} != worker ]] || kill -TERM "$pid" 2>/dev/null || true
+  done
+  for ((tick = 0; tick < ticks; tick++)); do
+    forget_gone
+    ((${#running[@]} > 0)) || break
+    sleep 0.2
+  done
+  for pid in "${!running[@]}"; do
+    pid_matches "$pid" "${running[$pid]}" || continue
+    if [[ ${kind[$pid]} == worker ]]; then kill -KILL "$pid" 2>/dev/null || true; else kill -TERM "$pid" 2>/dev/null || true; fi
+  done
+  for ((tick = 0; tick < 10; tick++)); do
+    forget_gone
+    ((${#running[@]} > 0)) || break
+    sleep 0.2
+  done
+  for pid in "${!running[@]}"; do
+    if [[ ${kind[$pid]} == worker ]]; then
+      alive+="${alive:+, }worker pid $pid"
+      workers=$((workers - 1))
+    else
+      alive+="${alive:+, }runner waiting for quota pid $pid"
+      waits=$((waits - 1))
+    fi
+  done
+  note "Ended $(counted "$workers" worker workers) and $(counted "$waits" 'runner waiting for quota' 'runners waiting for quota')."
+  log "stop --all: ended $workers workers and $waits runners waiting for quota"
+  [[ -z $alive ]] && return 0
+  note "Still alive: $alive."
+  return 1
+}
+
+# Drops from `running` (the caller's array) the processes that are gone.
+forget_gone() {
+  local pid
+  for pid in "${!running[@]}"; do
+    pid_matches "$pid" "${running[$pid]}" || unset "running[$pid]"
+  done
 }
 
 cmd_stop() {
@@ -141,33 +295,72 @@ cmd_stop() {
     --all) all=true ;;
     *) die "unknown stop option: $1" ;;
   esac
-  rm -f -- "$STATE/enabled"
   if $all; then
-    log "stop --all: ending the service and the clones"
+    state_locked runners rm -f -- "$STATE/enabled" "$STATE/runners"
+    log "stop --all: account switching for runners off; ending the service and the clones"
     systemctl --user stop "$UNIT.service" 2>/dev/null || true
     tmux_cmd kill-server 2>/dev/null || true
     if [[ -s $STATE/sessions.json ]]; then
       sessions_rewrite 'map(if .state == "running" then .state = "ended" else . end)'
     fi
-    note "Service and clones ended."
-    return 0
+    note "Service and clones ended. Account switching for runners is off."
+    end_runners
+    return
   fi
+  state_locked runners _switch_off
   log "stop: switch off; live clones keep running"
   service_wake
   note "Takeover off. Live clones keep running; the service leaves by itself when none is left."
-  note "To see the clones: $(attach_command)"
+  if udarnik_runners_enabled; then
+    note "Account switching for runners stays on; to turn it off: udarnik runners off"
+  fi
+  note "$(view_hint)"
+  report_still_running
+}
+
+cmd_runners() {
+  case "${1:-}" in
+    on)
+      udarnik_set_runners on
+      log "runners: account switching for runners on"
+      note "Account switching for runners on: udarnik account enabled succeeds and runners change accounts at a limit."
+      ;;
+    off)
+      udarnik_set_runners off
+      log "runners: account switching for runners off"
+      note "Account switching for runners off: runners stay on their own account.$(udarnik_enabled && printf ' The takeover of interactive sessions is still on.')"
+      ;;
+    status)
+      if udarnik_runners_enabled; then note "Account switching for runners: on"; else note "Account switching for runners: off"; fi
+      ;;
+    *) die 'usage: udarnik runners on|off|status' ;;
+  esac
 }
 
 # ---------------------------------------------------------------- account hook
 
 cmd_account() {
-  local sub=${1:-} account next text
+  local sub=${1:-} account next text kind='' epoch
+  local -a rest=()
   (($#)) && shift
+  if [[ $sub =~ ^(current|limit|pick)$ ]]; then
+    while (($#)); do
+      case "$1" in
+        --kind) (($# >= 2)) || die '--kind requires interactive or worker'; kind=$2; shift 2 ;;
+        *) rest+=("$1"); shift ;;
+      esac
+    done
+    [[ -z $kind || $kind =~ ^(interactive|worker)$ ]] || die "unknown kind: $kind (interactive or worker)"
+    set -- "${rest[@]+"${rest[@]}"}"
+    weekly_observe
+  fi
   case "$sub" in
-    enabled) udarnik_enabled ;;
+    enabled) udarnik_runners_enabled ;;
     current)
       account=$(account_of_env)
-      if udarnik_enabled && ! account_available "$account" && next=$(account_pick "$account"); then account=$next; fi
+      if udarnik_runners_enabled && ! account_available "$account" && next=$(PICK_KIND=$kind account_pick "$account"); then
+        account=$next
+      fi
       printf '%s\n' "$account"
       ;;
     limit)
@@ -175,29 +368,191 @@ cmd_account() {
       account=$1
       text=$(cat)
       is_limit_text "$text" || return 1
-      account_mark_out "$account" "$text" >/dev/null
-      next=$(account_pick "$account") || return 75
+      if epoch=$(account_mark_out "$account" "$text"); then share_out "$account" "$epoch"; fi
+      next=$(PICK_KIND=$kind account_pick "$account") || return 75
       printf '%s\n' "$next"
       ;;
+    clear)
+      # After a call that worked: nothing but a file read when the account is not marked out (no ssh, no lock).
+      # The call ended at --at (the time the runner's call ended), else when this command was entered: a mark made
+      # by a limit after that stays, here and on the other machines.
+      local at=$ENTERED_AT
+      while (($#)); do
+        case "$1" in
+          --kind) (($# >= 2)) || die '--kind requires interactive or worker'; shift 2 ;;
+          --at)
+            (($# >= 2)) && [[ $2 =~ ^[0-9]+$ ]] || die '--at requires an epoch'
+            # A call cannot end after this command was entered (a runner that passes milliseconds ends up here).
+            ((${#2} < 12 && $2 <= ENTERED_AT)) || die '--at is in the future (an epoch in seconds is expected)'
+            at=$2; shift 2 ;;
+          *) rest+=("$1"); shift ;;
+        esac
+      done
+      set -- "${rest[@]+"${rest[@]}"}"
+      (($#)) || die 'account clear requires ACCOUNT'
+      account=$1
+      # Not marked out: only the time of the call is kept (builtins), so a mark that was made before it and reaches
+      # this machine later is rejected.
+      account_marked_out "$account" || { account_note_back "$account" "$at"; return 0; }
+      if account_clear "$account" "$at"; then
+        log "account $(account_key "$account") is back (a call worked)"
+      fi
+      share_clear "$account" "$at"
+      ;;
+    learn-clear)
+      (($# >= 4)) || die 'account learn-clear requires IDENTITY KEY AT FROM'
+      # What this machine cleared comes back from the others, with its own name as origin: it already has it.
+      [[ $4 != "$(self_name)" ]] || return 0
+      account=$(account_matching "$1" "$2") || return 0
+      if account_learn_clear "$account" "$3"; then
+        log "account $(account_key "$account") is back (a call worked on $4)"
+      fi
+      ;;
+    learn)
+      (($# >= 3)) || die 'account learn requires IDENTITY KEY EPOCH'
+      account=$(account_matching "$1" "$2") || return 0
+      if account_learn_out "$account" "$3" "${5:-}" "${4:-}"; then
+        log "account $(account_key "$account") is out of quota until $(local_time "$3") (learned from ${4:-another machine})"
+      fi
+      ;;
+    learn-weekly)
+      (($# >= 6)) || die 'account learn-weekly requires IDENTITY KEY PERCENT RESETS_AT AT FROM'
+      account=$(account_matching "$1" "$2") || return 0
+      account_learn_weekly "$account" "$3" "$4" "$5" "$6" || true
+      ;;
     next) accounts_next_available_epoch ;;
+    wait) cmd_account_wait "$@" ;;
     env)
       (($#)) || die 'account env requires ACCOUNT'
       account_env "$1"
       ;;
-    pick) account_pick "$@" ;;
+    pick) PICK_KIND=$kind account_pick "$@" ;;
+    list) cmd_account_list "$@" ;;
     *) usage >&2; die "unknown account subcommand: ${sub:-}" ;;
   esac
 }
 
+# Every account of this machine, from files only (never the network): what a person needs to know to log in or open
+# the ones that are missing, and what the switching sees.
+cmd_account_list() {
+  local data
+  case "${1:-}" in
+    '') ;;
+    --json) accounts_json; return 0 ;;
+    *) die "unknown account list option: $1" ;;
+  esac
+  data=$(accounts_json)
+  jq -r 'def age: if . < 60 then "\(.)s" elif . < 3600 then "\(. / 60 | floor) min" elif . < 86400 then "\(. / 3600 | floor) h"
+      else "\(. / 86400 | floor) d" end;
+    .[] | [.key, .path, (.identity // "no identity"),
+      (if .logged_in then "logged in" else "not logged in" end),
+      (if .onboarded then "onboarded" else "not onboarded" end),
+      (if .available then "available" else "out until \(.out_until_local)" end),
+      (if .weekly_percent != null then "weekly \(.weekly_percent)% (\(.weekly_age_seconds | age) old, from \(.weekly_from))"
+       else "weekly unknown" end)] | join("  ")' <<<"$data"
+}
+
+# ---------------------------------------------------------------- the wait of a runner
+
+# The runners that wait for quota are processes udarnik owns: each one is registered in waits/<pid>.json, so that
+# status shows it and stop --all can end it. A runner that slept on its own would be invisible and would relaunch
+# its call after the sleep without asking whether the hook is still on.
+
+waits_directory() { printf '%s/waits\n' "$STATE"; }
+
+# The registered waits whose process is still the one that registered (a reused pid is not), one JSON per line.
+# Reads only: whoever wrote a stale file removes it.
+waits_registered() {
+  local file pid start
+  for file in "$(waits_directory)"/*.json; do
+    [[ -f $file ]] || continue
+    IFS=$'\t' read -r pid start < <(jq -r '[.pid, .start] | @tsv' "$file" 2>/dev/null) || continue
+    [[ $pid =~ ^[0-9]+$ ]] && pid_matches "$pid" "$start" || continue
+    jq -c '.' "$file" 2>/dev/null || true
+  done
+}
+
+waits_json() {
+  waits_registered | jq -sc 'map({pid, label, cwd, since, until, until_local:(.until | strflocaltime("%d/%m %H:%M"))})'
+}
+
+# The record of this wait, written whole: a reader never sees half of it.
+_wait_record() { # LABEL SINCE UNTIL
+  local file
+  file="$(waits_directory)/$$.json"
+  jq -cn --argjson pid "$$" --argjson start "$(pid_start "$$")" --arg label "$1" --arg cwd "$PWD" \
+    --argjson since "$2" --argjson until "$3" '{pid:$pid, start:$start, label:$label, cwd:$cwd, since:$since, until:$until}' \
+    >"$file.new" && mv -f -- "$file.new" "$file"
+}
+
+_wait_cleanup() {
+  [[ -z ${WAIT_SLEEPER:-} ]] || kill "$WAIT_SLEEPER" 2>/dev/null || true
+  rm -f -- "$(waits_directory)/$$.json" "$(waits_directory)/$$.json.new"
+}
+
+# The wait of a runner whose every account is out. Returns 0 when an account is back (it can be one that a call
+# cleared, or that another machine learned about, meanwhile), 1 at once when the runners switch is off and as soon as
+# it is turned off meanwhile. Each slice reads files only; the record is rewritten only when the time it waits for
+# changes.
+cmd_account_wait() {
+  local label='' slice=${UDARNIK_WAIT_SLICE:-10} since until next who file
+  while (($#)); do
+    case "$1" in
+      --label) (($# >= 2)) || die '--label requires a text'; label=$2; shift 2 ;;
+      *) die "unknown account wait option: $1" ;;
+    esac
+  done
+  [[ $slice =~ ^([1-9][0-9]*(\.[0-9]+)?|0\.[0-9]*[1-9][0-9]*)$ ]] || slice=10
+  udarnik_runners_enabled || return 1
+  since=$(now)
+  until=$(accounts_next_available_epoch)
+  ((until > since)) || return 0
+  mkdir -p -- "$(waits_directory)"
+  # The files of waits that were killed before they could remove their own.
+  for file in "$(waits_directory)"/*.json; do
+    [[ -f $file ]] || continue
+    pid_matches "$(jq -r '.pid // empty' "$file" 2>/dev/null)" "$(jq -r '.start // empty' "$file" 2>/dev/null)" \
+      || rm -f -- "$file"
+  done
+  WAIT_SLEEPER=''
+  trap _wait_cleanup EXIT
+  trap 'exit 130' INT
+  trap 'exit 143' TERM
+  _wait_record "$label" "$since" "$until"
+  who=${label:-$$}
+  log "runner $who waits for quota until $(local_time "$until")"
+  while :; do
+    # `wait` returns at once for a trapped signal, which `sleep` in the foreground would only do after the slice.
+    sleep "$slice" & WAIT_SLEEPER=$!
+    wait "$WAIT_SLEEPER" || true
+    WAIT_SLEEPER=''
+    if ! udarnik_runners_enabled; then
+      log "runner $who stops waiting: the runners switch is off"
+      return 1
+    fi
+    next=$(accounts_next_available_epoch)
+    if ((next <= $(now))); then
+      log "runner $who stops waiting: an account is back"
+      return 0
+    fi
+    if ((next != until)); then
+      until=$next
+      _wait_record "$label" "$since" "$until"
+    fi
+  done
+}
+
 # ---------------------------------------------------------------- sessions.json
 
-_sessions_rewrite() {
-  local filter=$1 file="$STATE/sessions.json" temporary
-  shift
+# Rewrites a JSON array file with a jq filter (and its jq arguments), whole: a reader never sees half of it.
+_array_rewrite() {
+  local file=$1 filter=$2 temporary
+  shift 2
   [[ -s $file ]] || printf '[]\n' >"$file"
-  temporary=$(mktemp "$STATE/.sessions.XXXXXX")
+  temporary=$(mktemp "$STATE/.array.XXXXXX")
   if jq "$@" "$filter" "$file" >"$temporary"; then mv -f -- "$temporary" "$file"; else rm -f -- "$temporary"; return 1; fi
 }
+_sessions_rewrite() { _array_rewrite "$STATE/sessions.json" "$@"; }
 sessions_rewrite() { state_locked sessions _sessions_rewrite "$@"; }
 
 sessions_json() {
@@ -227,11 +582,21 @@ descendants() {
 
 # ---------------------------------------------------------------- session discovery
 
+# "STATE START" of a process from /proc/<pid>/stat (fields 3 and 22, counted after the command name).
+pid_stat() { sed -E 's/^.*\) //' "/proc/$1/stat" 2>/dev/null | awk '{ print $1, $20 }'; }
+
+# The start time of a live process, as pid_matches reads it.
+pid_start() {
+  local state start
+  IFS=' ' read -r state start < <(pid_stat "$1") || return 1
+  [[ -n $state && $state != Z && $state != X ]] || return 1
+  printf '%s\n' "$start"
+}
+
 pid_matches() {
   local pid=$1 start=${2:-} state actual
-  # State and start time from /proc/<pid>/stat (fields 3 and 22, counted after the command name). A zombie is gone,
-  # and a different start time is a reused pid.
-  IFS=' ' read -r state actual < <(sed -E 's/^.*\) //' "/proc/$pid/stat" 2>/dev/null | awk '{ print $1, $20 }') || return 1
+  # A zombie is gone, and a different start time is a reused pid.
+  IFS=' ' read -r state actual < <(pid_stat "$pid") || return 1
   [[ -n $state && $state != Z && $state != X ]] || return 1
   [[ -z $start || $actual == "$start" ]]
 }
@@ -265,16 +630,32 @@ watch_root() {
   printf '%s\n' "${root%/}"
 }
 
-# One JSON line per live interactive session in every account (below the root when one is set).
+# Whether $1, the entrypoint a session registered with, is a headless one: a worker (claude -p registers as interactive
+# with the entrypoint sdk-cli), never a session to watch or take over. UDARNIK_HEADLESS_ENTRYPOINTS lists them (commas,
+# colons or spaces; default sdk-cli). No entrypoint (older Claude Code) is never headless: the kind decides.
+is_headless_entrypoint() {
+  local entry
+  local -a list
+  [[ -n ${1:-} ]] || return 1
+  IFS=' ' read -ra list <<<"$(tr ',:' '  ' <<<"${UDARNIK_HEADLESS_ENTRYPOINTS-sdk-cli}")"
+  for entry in "${list[@]}"; do
+    [[ $entry == "$1" ]] && return 0
+  done
+  return 1
+}
+
+# One JSON line per live interactive session in every account (below the root when one is set, unless $1 is "any").
+# The headless ones (see is_headless_entrypoint) are workers and are left out.
 scan_sessions() {
-  local account file pid id cwd kind updated started history probe state root
-  root=$(watch_root)
+  local account file pid id cwd kind updated started entrypoint history probe state root=''
+  [[ ${1:-} == any ]] || root=$(watch_root)
   while IFS= read -r account; do
     [[ -n $account ]] || continue
     for file in "$account"/sessions/*.json; do
       [[ -f $file ]] || continue
-      IFS=$'\t' read -r pid id cwd kind updated started < <(jq -r '[.pid, .sessionId, .cwd, .kind, (.updatedAt // 0), (.startedAt // 0)] | @tsv' "$file" 2>/dev/null) || continue
+      IFS=$'\t' read -r pid id cwd kind updated started entrypoint < <(jq -r '[.pid, .sessionId, .cwd, .kind, (.updatedAt // 0), (.startedAt // 0), (.entrypoint // "")] | @tsv' "$file" 2>/dev/null) || continue
       [[ $pid =~ ^[0-9]+$ && -n $id && $kind == interactive ]] || continue
+      ! is_headless_entrypoint "$entrypoint" || continue
       [[ -z $root || $cwd == "$root" || $cwd == "$root"/* ]] || continue
       pid_matches "$pid" "$(jq -r '.procStart // empty' "$file" 2>/dev/null)" || continue
       history=$(history_file "$account" "$cwd" "$id") || continue
@@ -282,7 +663,9 @@ scan_sessions() {
       state=$(classify_session "$probe" "$started")
       jq -cn --arg account "$account" --argjson pid "$pid" --arg id "$id" --arg cwd "$cwd" --arg history "$history" \
         --arg state "$state" --argjson updated "$updated" --argjson started "$started" --argjson probe "$probe" \
-        '{account:$account, pid:$pid, id:$id, cwd:$cwd, history:$history, state:$state, updated:$updated, started:$started, probe:$probe}'
+        --arg entrypoint "$entrypoint" \
+        '{account:$account, pid:$pid, id:$id, cwd:$cwd, history:$history, state:$state, updated:$updated, started:$started, probe:$probe,
+          entrypoint:(if $entrypoint == "" then "cli" else $entrypoint end)}'
     done
   done < <(accounts_list)
 }
@@ -301,6 +684,335 @@ in_scope() {
     [[ -n $current ]] || return 1
   done
   return 1
+}
+
+# ---------------------------------------------------------------- pinned sessions
+
+# A pinned session (its id starts with one of the prefixes of the pinned file) changes accounts on this machine like
+# any other, but never moves to another one: neither a takeover across machines nor a move.
+is_pinned() {
+  local token
+  [[ -s $STATE/pinned ]] || return 1
+  while IFS= read -r token; do
+    [[ -n $token && $1 == "$token"* ]] && return 0
+  done <"$STATE/pinned"
+  return 1
+}
+
+pins_json() {
+  if [[ -s $STATE/pinned ]]; then jq -Rsc 'split("\n") | map(select(length > 0))' <"$STATE/pinned"; else printf '[]\n'; fi
+}
+
+_append_pin() { printf '%s\n' "$1" >>"$STATE/pinned"; }
+
+_remove_pins() { # ID...: every pinned prefix that one of the IDs starts with
+  local token removed=0 temporary id drop
+  [[ -s $STATE/pinned ]] || return 1
+  temporary=$(mktemp "$STATE/.pinned.XXXXXX")
+  while IFS= read -r token; do
+    drop=false
+    for id in "$@"; do
+      [[ $id != "$token"* ]] || drop=true
+    done
+    if [[ -n $token ]] && $drop; then removed=$((removed + 1)); continue; fi
+    [[ -z $token ]] || printf '%s\n' "$token"
+  done <"$STATE/pinned" >"$temporary"
+  mv -f -- "$temporary" "$STATE/pinned"
+  ((removed > 0))
+}
+
+# The clone of a pinned session is pinned too, so the chain stays on this machine. The pin outlives the clone's window:
+# the session is still there to be resumed with its id, and it must stay pinned (about 37 bytes per clone).
+inherit_pin() {
+  local original=$1 clone=$2
+  [[ -n $clone ]] && is_pinned "$original" && ! is_pinned "$clone" || return 0
+  state_locked pins _append_pin "$clone"
+  log "clone ${clone:0:8} of pinned session ${original:0:8} is pinned too"
+}
+
+cmd_pin() {
+  local id=${1:-}
+  [[ $id =~ ^[A-Za-z0-9-]+$ ]] || die 'usage: udarnik pin ID (a session id or the start of one)'
+  mkdir -p -- "$STATE"
+  if is_pinned "$id"; then note "Session $id is already pinned to $(self_name)."; return 0; fi
+  state_locked pins _append_pin "$id"
+  log "pin: sessions starting with $id never move to another machine"
+  note "Session $id pinned to $(self_name): it changes accounts here when one runs out, but never moves to another machine (its clones neither)."
+}
+
+cmd_unpin() {
+  local id=${1:-}
+  [[ $id =~ ^[A-Za-z0-9-]+$ ]] || die 'usage: udarnik unpin ID'
+  if state_locked pins _remove_pins "$id"; then
+    log "unpin: session $id may move to another machine again"
+    note "Session $id is no longer pinned: it may move to another machine again."
+  else
+    note "Session $id was not pinned."
+  fi
+}
+
+cmd_pins() {
+  local token lines
+  if [[ ! -s $STATE/pinned ]]; then note "No session is pinned to $(self_name)."; return 0; fi
+  lines=$(scan_sessions any | jq -r '[.id, (.probe.title // "")] | @tsv')
+  note "Pinned to $(self_name) (they change accounts here but never move to another machine):"
+  while IFS= read -r token; do
+    [[ -n $token ]] || continue
+    note "  $token$(awk -F'\t' -v t="$token" 'index($1, t) == 1 { printf "  live: %s %s", substr($1, 1, 8), $2 }' <<<"$lines")"
+  done <"$STATE/pinned"
+}
+
+# ---------------------------------------------------------------- kept sessions
+
+# A kept session (kept.json) is one the service brings back when its process dies for any reason but a usage limit: it
+# stops the systemd scope the session ran in (what the session left running, its subagents' commands, lives in that
+# scope's cgroup and dies with it), then resumes the same session (claude --resume ID, no fork) in a new scope of its
+# own, with a message. The takeover of a kept session that hit its limit moves the keep to the clone.
+# A record: id, account, cwd, pid, start (of the process), scope ("": none), window_id (of the last resume), resumes
+# (epochs), note (the last thing logged about it).
+
+kept_file() { printf '%s/kept.json\n' "$STATE"; }
+
+kept_json() {
+  if [[ -s $(kept_file) ]]; then cat -- "$(kept_file)"; else printf '[]\n'; fi
+}
+
+_kept_rewrite() { _array_rewrite "$(kept_file)" "$@"; }
+kept_rewrite() { state_locked kept _kept_rewrite "$@"; }
+
+# The record of the session ID (empty when it is not kept).
+kept_record() { kept_json | jq -c --arg id "$1" '.[] | select(.id == $id)'; }
+
+is_kept() { kept_json | jq -e --arg id "$1" 'any(.[]; .id == $id)' >/dev/null; }
+
+# Changes the record of ID with a jq update expression and its jq arguments.
+kept_patch() { # ID EXPRESSION [JQ-ARGUMENT...]
+  local id=$1 expression=$2
+  shift 2
+  kept_rewrite "map(if .id == \$id then ($expression) else . end)" --arg id "$id" "$@"
+}
+
+kept_forget() { kept_rewrite 'map(select(.id != $id))' --arg id "$1"; }
+
+kept_restore() { kept_rewrite 'map(select(.id != $r.id)) + [$r]' --argjson r "$1"; }
+
+# What the record says, once: a line is logged when it differs from the last one logged for that session.
+kept_note() { # ID TEXT (a TEXT that starts with ATTENTION puts the marker first in the line)
+  local id=$1 text=$2
+  [[ $(kept_record "$id" | jq -r '.note // ""') != "$text" ]] || return 0
+  if [[ $text == "ATTENTION "* ]]; then log "ATTENTION kept session ${id:0:8}: ${text#ATTENTION }"; else log "kept session ${id:0:8}: $text"; fi
+  kept_patch "$id" '.note = $note' --arg note "$text"
+}
+
+keep_message() { printf '%s\n' "${UDARNIK_KEEP_MESSAGE:-This session stopped unexpectedly and was resumed. If you are a campaign host, run /campaign-host to register again and continue.}"; }
+
+# The systemd scope PID runs in, whatever its kind (empty when it is not in one). UDARNIK_PROC (tests only) is the
+# folder that holds the <pid>/cgroup files.
+process_unit() {
+  local line unit
+  line=$(grep -m1 -E '^0::|name=systemd' "${UDARNIK_PROC:-/proc}/$1/cgroup" 2>/dev/null) || return 0
+  unit=${line##*/}
+  [[ $unit == *.scope ]] && printf '%s\n' "$unit"
+  return 0
+}
+
+# Whether stopping the scope ends only what the session started: the scopes of a login session, of a terminal, of an
+# application and of a tmux pane hold the person's shells and windows too, so they are never stopped.
+dedicated_scope() {
+  [[ $1 =~ ^[A-Za-z0-9:_.@\\-]+\.scope$ ]] || return 1
+  [[ ! $1 =~ ^(init|session-[0-9]+|app-.+|tmux-spawn-.+|vte-spawn-.+)\.scope$ ]]
+}
+
+# The scope PID runs in when stopping it is safe (see dedicated_scope), else nothing.
+process_scope() {
+  local unit
+  unit=$(process_unit "$1")
+  if [[ -n $unit ]] && dedicated_scope "$unit"; then printf '%s\n' "$unit"; fi
+  return 0
+}
+
+# Stops a scope that is still active (what is left in it dies) and says so.
+stop_scope() { # SCOPE ID
+  local scope=$1 id=$2
+  dedicated_scope "$scope" || return 0
+  systemctl --user is-active --quiet "$scope" 2>/dev/null || return 0
+  if systemctl --user stop "$scope" 2>/dev/null; then
+    log "kept session ${id:0:8}: stopped scope $scope; what it left running ended with it"
+  else
+    log "ATTENTION kept session ${id:0:8}: could not stop scope $scope; what it left running may still be alive"
+  fi
+}
+
+# Stops the scope of a kept session; its record forgets the scope.
+kept_stop_scope() {
+  local scope
+  scope=$(kept_record "$1" | jq -r '.scope // ""')
+  [[ -n $scope ]] || return 0
+  stop_scope "$scope" "$1"
+  kept_patch "$1" '.scope = ""'
+}
+
+# Whether the process of a record is the one that registered.
+kept_process_runs() {
+  local pid start
+  pid=$(jq -r '.pid // empty' <<<"$1"); start=$(jq -r '.start // empty' <<<"$1")
+  [[ $pid =~ ^[0-9]+$ ]] && pid_matches "$pid" "$start"
+}
+
+# Whether a kept session runs: its process, else the window of its last resume while that still runs.
+kept_alive() {
+  local window_id
+  kept_process_runs "$1" && return 0
+  window_id=$(jq -r '.window_id // empty' <<<"$1")
+  [[ -n $window_id && $(window_state "$window_id") == alive ]]
+}
+
+# The clone of a kept session is the new host: the keep moves to it, with its process, its scope and its window.
+inherit_keep() { # ORIGINAL CLONE ACCOUNT PID WINDOW_ID
+  local original=$1 clone=$2 account=$3 pid=$4 window_id=$5
+  [[ -n $clone && $pid =~ ^[0-9]+$ ]] && is_kept "$original" || return 0
+  kept_patch "$original" '.id = $clone | .account = $account | .pid = $pid | .start = $start | .scope = $scope
+    | .window_id = $window | .resumes = [] | .note = ""' --arg clone "$clone" --arg account "$account" --argjson pid "$pid" \
+    --arg start "$(pid_start "$pid" || true)" --arg scope "$(process_scope "$pid")" --arg window "$window_id"
+  log "kept session ${original:0:8}: the keep moved to its clone ${clone:0:8}"
+}
+
+cmd_keep() {
+  local wanted=${1:-} matches count line id pid unit scope='' existed=false
+  [[ $wanted =~ ^[A-Za-z0-9-]+$ ]] || die 'usage: udarnik keep ID (a session id or the start of one)'
+  mkdir -p -- "$STATE"
+  matches=$(scan_sessions any | jq -sc --arg w "$wanted" '[.[] | select(.id | startswith($w))]')
+  count=$(jq 'length' <<<"$matches")
+  ((count > 0)) || die "no live session here starts with $wanted; see: udarnik status"
+  ((count == 1)) || die "$count live sessions start with $wanted; give more of the id"
+  line=$(jq -c '.[0]' <<<"$matches")
+  id=$(jq -r '.id' <<<"$line"); pid=$(jq -r '.pid' <<<"$line")
+  # Only a terminal session (entrypoint cli) is resumed here: an app (T3 Code, the desktop app, an editor) hosts and
+  # restarts its own sessions, and resuming one in tmux too would run the same session twice.
+  local entrypoint
+  entrypoint=$(jq -r '.entrypoint // "cli"' "$(jq -r '.account' <<<"$line")/sessions/$pid.json" 2>/dev/null || printf 'cli')
+  [[ $entrypoint == cli ]] || die "session ${id:0:8} is hosted by $entrypoint, which restarts it; udarnik never resumes it"
+  unit=$(process_unit "$pid")
+  if [[ -n $unit ]] && dedicated_scope "$unit"; then scope=$unit; fi
+  ! is_kept "$id" || existed=true
+  kept_rewrite '(map(select(.id == $r.id))[0] // {}) as $old | map(select(.id != $r.id)) + [$old + $r]' \
+    --argjson r "$(jq -cn --arg id "$id" --arg account "$(jq -r '.account' <<<"$line")" --arg cwd "$(jq -r '.cwd' <<<"$line")" \
+      --argjson pid "$pid" --arg start "$(pid_start "$pid")" --arg scope "$scope" \
+      '{id:$id, account:$account, cwd:$cwd, pid:$pid, start:$start, scope:$scope}')"
+  log "keep: session ${id:0:8} kept (scope: ${scope:-none})"
+  if $existed; then
+    note "Session ${id:0:8} was already kept; its process and scope were registered again."
+  else
+    note "Session ${id:0:8} kept on $(self_name): when its process stops for any reason but a usage limit, the service resumes it as the same session."
+  fi
+  if [[ -n $scope ]]; then
+    note "It runs in the scope $scope: when it is resumed, that scope is stopped first, which ends what the session left running."
+  elif [[ -n $unit ]]; then
+    note "It runs in $unit, which holds other things too (a login session, a terminal, a pane), so that scope is never stopped; what the session leaves running is not ended when it is resumed."
+  else
+    note "It does not run in a systemd scope of its own, so what it leaves running is not ended when it is resumed. To get that, start it with: systemd-run --user --scope --unit=NAME claude"
+  fi
+  if ! udarnik_enabled; then note "The takeover is off: kept sessions are brought back only while it is on (udarnik start)."; fi
+}
+
+cmd_unkeep() {
+  local id=${1:-} before after
+  [[ $id =~ ^[A-Za-z0-9-]+$ ]] || die 'usage: udarnik unkeep ID'
+  before=$(kept_json | jq 'length')
+  kept_rewrite 'map(select(.id | startswith($w) | not))' --arg w "$id"
+  after=$(kept_json | jq 'length')
+  if ((after < before)); then
+    log "unkeep: sessions starting with $id are no longer kept"
+    note "Session $id is no longer kept: the service will not resume it."
+  else
+    note "Session $id was not kept."
+  fi
+}
+
+# Brings back the kept sessions whose process is gone: every round of the service, while the takeover is on.
+revive_kept() {
+  local record id account cwd pid scope window_id history probe now_s last count started pair live='' adopted
+  local backoff=${UDARNIK_KEEP_BACKOFF:-120} max=${UDARNIK_KEEP_MAX:-5} model effort permission name unit kpid
+  [[ $backoff =~ ^[0-9]+$ ]] || backoff=120
+  [[ $max =~ ^[0-9]+$ ]] || max=5
+  [[ -s $(kept_file) ]] || return 0
+  while IFS= read -r record; do
+    [[ -n $record ]] || continue
+    id=$(jq -r '.id' <<<"$record"); account=$(jq -r '.account' <<<"$record"); cwd=$(jq -r '.cwd' <<<"$record")
+    scope=$(jq -r '.scope // ""' <<<"$record"); window_id=$(jq -r '.window_id // ""' <<<"$record")
+    if kept_alive "$record"; then
+      # A resume whose session was not registered in time: it is, now.
+      if ! kept_process_runs "$record" && pair=$(discover_clone "$account" "$window_id" "$id" 1 resumed); then
+        kpid=${pair#* }
+        kept_patch "$id" '.pid = $pid | .start = $start | .scope = $scope' --argjson pid "$kpid" \
+          --arg start "$(pid_start "$kpid" || true)" --arg scope "$(process_scope "$kpid")"
+      fi
+      continue
+    fi
+    if [[ -n $window_id ]]; then
+      if [[ $(window_state "$window_id") == dead ]]; then tmux_cmd kill-window -t "$window_id" 2>/dev/null || true; fi
+      kept_patch "$id" '.window_id = ""'
+    fi
+    # The owner may have resumed it by hand: the session runs again, under another pid.
+    [[ -n $live ]] || live=$(scan_sessions any)
+    adopted=$(jq -c --arg id "$id" 'select(.id == $id)' <<<"$live" | head -n 1)
+    if [[ -n $adopted ]]; then
+      pid=$(jq -r '.pid' <<<"$adopted")
+      kept_patch "$id" '.account = $account | .pid = $pid | .start = $start | .scope = $scope | .note = ""' \
+        --arg account "$(jq -r '.account' <<<"$adopted")" --argjson pid "$pid" --arg start "$(pid_start "$pid" || true)" \
+        --arg scope "$(process_scope "$pid")"
+      log "kept session ${id:0:8}: running again as pid $pid; registered"
+      continue
+    fi
+    if already_taken "$id"; then
+      kept_note "$id" "its process is gone and a clone took it over; the keep goes to the clone once it is known"
+      continue
+    fi
+    if ! history=$(history_file "$account" "$cwd" "$id"); then
+      kept_note "$id" "ATTENTION its process is gone and its history was not found in $(account_label "$account"); nothing was done"
+      continue
+    fi
+    probe=$(python3 -I "$PROBE" "$history" 2>/dev/null) || { kept_note "$id" "ATTENTION its history cannot be read; nothing was done"; continue; }
+    if [[ $(classify_session "$probe" 0) == limit ]]; then
+      kept_note "$id" "its process is gone and its history ends at a usage limit, which the takeover handles; it is resumed here once the limit is over"
+      continue
+    fi
+    now_s=$(now)
+    last=$(jq -r '(.resumes // []) | max // 0' <<<"$record")
+    ((now_s - last >= backoff)) || continue
+    count=$(jq -r --argjson since "$((now_s - 3600))" '[(.resumes // [])[] | select(. > $since)] | length' <<<"$record")
+    if ((count >= max)); then
+      kept_note "$id" "ATTENTION it was resumed $count times in the last hour (UDARNIK_KEEP_MAX $max) and stopped again; not resuming it again for now. Look at it: cd $cwd && claude --resume $id"
+      continue
+    fi
+    [[ -d $cwd ]] || { kept_note "$id" "ATTENTION its folder $cwd no longer exists; nothing was done"; continue; }
+    command -v "$CLAUDE_COMMAND" >/dev/null 2>&1 || { kept_note "$id" "ATTENTION command $CLAUDE_COMMAND is not in the service PATH; nothing was done"; continue; }
+    # What the dead session left running goes first: the resumed session is told which of it did not finish.
+    if [[ -n $scope ]]; then
+      stop_scope "$scope" "$id"
+      kept_patch "$id" '.scope = ""'
+    fi
+    model=$(jq -r '.model // empty' <<<"$probe"); effort=$(jq -r '.effort // empty' <<<"$probe")
+    permission=$(jq -r '.permission_mode // empty' <<<"$probe")
+    [[ -z $effort ]] || [[ $effort =~ ^(low|medium|high|xhigh|max)$ ]] || effort=''
+    [[ -z $model ]] || [[ $model =~ $model_pattern ]] || model=''
+    unit="udarnik-keep-${id:0:8}-$now_s"
+    log "kept session ${id:0:8}: its process is gone; resuming it on $(account_key "$account") (model ${model:-default}, effort ${effort:-default}, permission ${permission:-default})"
+    if ! started=$(start_clone "$id" "$cwd" "$account" "$model" "$effort" "$permission" "$(keep_message)" resume "$unit"); then
+      kept_note "$id" "ATTENTION it did not start in tmux; resume it by hand with: cd $cwd && claude --resume $id"
+      continue
+    fi
+    window_id=${started%% *}; name=${started#* }
+    kept_patch "$id" '.resumes = ((.resumes // []) + [$at]) | .window_id = $window | .note = ""' --argjson at "$now_s" --arg window "$window_id"
+    if pair=$(discover_clone "$account" "$window_id" "$id" "" resumed); then
+      kpid=${pair#* }
+      kept_patch "$id" '.pid = $pid | .start = $start | .scope = $scope' --argjson pid "$kpid" \
+        --arg start "$(pid_start "$kpid" || true)" --arg scope "$(process_scope "$kpid")"
+      log "kept session ${id:0:8}: resumed on $(account_key "$account"), window $name (pid $kpid, scope $(process_scope "$kpid"))"
+    else
+      log "ATTENTION kept session ${id:0:8}: resumed in window $name but its session did not register; check with: $(attach_command "$name")"
+    fi
+  done < <(kept_json | jq -c '.[]')
 }
 
 # ---------------------------------------------------------------- takeover
@@ -336,6 +1048,8 @@ copy_history() {
   local history=$1 target=$2 id=$3 source_dir folder
   source_dir=$(dirname -- "$history")
   folder="$target/projects/$(basename -- "$source_dir")"
+  # Accounts that share one projects folder already see the history.
+  [[ ! $source_dir -ef $folder ]] || return 0
   mkdir -p -- "$folder"
   cp -a -- "$history" "$folder/$id.jsonl.partial"
   mv -f -- "$folder/$id.jsonl.partial" "$folder/$id.jsonl"
@@ -346,19 +1060,43 @@ copy_history() {
   cmp -s -- "$history" "$folder/$id.jsonl"
 }
 
-# Session id and pid of the claude process that runs in the tmux window.
+# A clone that starts in a folder its account never trusted stops on Claude Code's question about that folder, with
+# "No, exit" selected. The original session worked in that folder (or in its counterpart on another machine), so the
+# clone trusts it: the selection moves to "Yes, I trust this folder" and is confirmed. True when it answered.
+answer_trust() {
+  local window_id=$1 screen tries=0
+  while ((tries++ < 4)); do
+    screen=$(tmux_cmd capture-pane -p -t "$window_id" 2>/dev/null) || return 1
+    grep -q 'Yes, I trust this folder' <<<"$screen" || return 1
+    if grep -qE '^[[:space:]]*[^[:space:]]+[[:space:]]+Yes, I trust this folder' <<<"$screen"; then
+      tmux_cmd send-keys -t "$window_id" Enter
+      return 0
+    fi
+    tmux_cmd send-keys -t "$window_id" Down
+    sleep 0.5
+  done
+  return 1
+}
+
+# Session id and pid of the claude process that runs in the tmux window: the fork of ORIGINAL (a session id other than
+# ORIGINAL), or, with a fifth argument, ORIGINAL itself resumed (a kept session brought back).
 discover_clone() {
-  local target=$1 window_id=$2 original=$3 wait_seconds=${4:-${UDARNIK_CLONE_WAIT_SECONDS:-90}} deadline pane pid file id
+  local target=$1 window_id=$2 original=$3 wait_seconds=${4:-${UDARNIK_CLONE_WAIT_SECONDS:-90}} resumed=${5:-} deadline pane pid file id
   deadline=$((SECONDS + wait_seconds))
   while :; do
     [[ $(window_state "$window_id") == alive ]] || return 1
+    if answer_trust "$window_id"; then
+      log "clone of ${original:0:8}: trusted its folder, where the original session worked"
+    fi
     pane=$(window_pane_pid "$window_id")
     if [[ -n $pane ]]; then
       for pid in $(descendants "$pane"); do
         file="$target/sessions/$pid.json"
         [[ -f $file ]] || continue
         id=$(jq -r '.sessionId // empty' "$file" 2>/dev/null) || continue
-        if [[ -n $id && $id != "$original" ]]; then printf '%s %s\n' "$id" "$pid"; return 0; fi
+        if [[ -n $id && ( ( -n $resumed && $id == "$original" ) || ( -z $resumed && $id != "$original" ) ) ]]; then
+          printf '%s %s\n' "$id" "$pid"; return 0
+        fi
       done
     fi
     ((SECONDS < deadline)) || return 1
@@ -366,8 +1104,12 @@ discover_clone() {
   done
 }
 
+# Starts claude in a window of the tmux server: a fork of ORIGINAL (MODE fork, the window c-<id8>), or ORIGINAL itself
+# (MODE resume, the window k-<id8>). With a UNIT, claude runs in a systemd scope of that name, so what it leaves
+# running can be ended by stopping the scope.
 start_clone() {
-  local original=$1 cwd=$2 target=$3 model=$4 effort=$5 permission=$6 message=$7 directory launcher name window_id
+  local original=$1 cwd=$2 target=$3 model=$4 effort=$5 permission=$6 message=$7 mode=${8:-fork} unit=${9:-}
+  local directory launcher name window_id
   directory="$STATE/clones/${original:0:8}-$(now)"
   mkdir -p -- "$directory"
   printf '%s\n' "$message" >"$directory/message"
@@ -377,13 +1119,17 @@ start_clone() {
     printf 'cd %q || exit 1\n' "$cwd"
     # The command word is written as is and resolved by the tmux server's PATH: it may be a wrapper that confines the
     # network, so it is never replaced by an absolute path.
-    printf 'exec %s %q --resume %q --fork-session' "$(account_env "$target")" "$CLAUDE_COMMAND" "$original"
+    printf 'exec '
+    [[ -z $unit ]] || printf 'systemd-run --user --scope --quiet --collect --unit=%q ' "$unit"
+    printf '%s %q --resume %q' "$(account_env "$target")" "$CLAUDE_COMMAND" "$original"
+    [[ $mode != fork ]] || printf ' --fork-session'
     [[ -z $model ]] || printf ' --model %q' "$model"
     [[ -z $effort ]] || printf ' --effort %q' "$effort"
     [[ -z $permission ]] || printf ' --permission-mode %q' "$permission"
     printf ' "$(cat %q)"\n' "$directory/message"
   } >"$launcher"
   name="c-${original:0:8}"
+  [[ $mode == fork ]] || name="k-${original:0:8}"
   if tmux_cmd has-session -t "$TMUX_SESSION" 2>/dev/null; then
     tmux_cmd set-option -g remain-on-exit on
     window_id=$(tmux_cmd new-window -d -P -F '#{window_id}' -t "$TMUX_SESSION:" -n "$name" -c "$cwd" "bash $(printf '%q' "$launcher")")
@@ -393,21 +1139,30 @@ start_clone() {
     [[ ${UDARNIK_CLONE_SCOPE:-on} == off ]] || scope=(systemd-run --user --scope --quiet --collect --unit="$UNIT-clones-$(now)")
     window_id=$("${scope[@]}" tmux -L "$TMUX_SOCKET" new-session -d -P -F '#{window_id}' -s "$TMUX_SESSION" -n "$name" -c "$cwd" -x 200 -y 50 "bash $(printf '%q' "$launcher")" \; set-option -g remain-on-exit on)
   fi
+  [[ -n $window_id ]] || return 1
   printf '%s %s\n' "$window_id" "$name"
 }
 
 # Takes one limited session over. $1 is the scan line (JSON).
 model_pattern='^[][A-Za-z0-9._:-]+$'
 take_over() {
-  local line=$1 account pid id cwd history probe text hint model effort permission target
+  local line=$1 account pid id cwd history probe text hint model effort permission target epoch kept=false message unit=''
   account=$(jq -r '.account' <<<"$line"); pid=$(jq -r '.pid' <<<"$line"); id=$(jq -r '.id' <<<"$line")
   cwd=$(jq -r '.cwd' <<<"$line"); history=$(jq -r '.history' <<<"$line"); probe=$(jq -c '.probe' <<<"$line")
   text=$(jq -r '.text // ""' <<<"$probe"); hint=$(jq -r '.resets_at // empty' <<<"$probe")
   model=$(jq -r '.model // empty' <<<"$probe"); effort=$(jq -r '.effort // empty' <<<"$probe")
   permission=$(jq -r '.permission_mode // empty' <<<"$probe")
-  account_mark_out "$account" "$text" "$hint" >/dev/null
-  if ! target=$(account_pick "$account"); then
-    log "session ${id:0:8}: account $(account_key "$account") hit its limit and no other account is available; trying again next round"
+  if epoch=$(account_mark_out "$account" "$text" "$hint"); then share_out "$account" "$epoch"; fi
+  if ! target=$(PICK_ONBOARDED=1 PICK_KIND=interactive account_pick "$account"); then
+    if target=$(account_pick "$account"); then
+      log "session ${id:0:8}: account $(account_key "$target") has quota but Claude Code was never opened interactively in it here, so a clone would stop on its first-run screens; open it once: $(account_env "$target") claude"
+    fi
+    fleet_take_over "$line" "$account" && return 0
+    if has_fleet && is_pinned "$id"; then
+      log "session ${id:0:8}: account $(account_key "$account") hit its limit and no other account is available here; the session is pinned to this machine, so it waits here; trying again next round"
+      return 0
+    fi
+    log "session ${id:0:8}: account $(account_key "$account") hit its limit and no other account is available$(has_fleet && printf ' here or on another machine'); trying again next round"
     return 0
   fi
   [[ -d $cwd ]] || { log "session ${id:0:8}: folder $cwd no longer exists; nothing was done"; return 0; }
@@ -423,6 +1178,12 @@ take_over() {
     return 0
   fi
   log "session ${id:0:8}: process $pid ended"
+  # A kept session: what it left running dies with its scope, and its clone is the new host, in a scope of its own.
+  if is_kept "$id"; then
+    kept=true
+    kept_stop_scope "$id"
+    unit="udarnik-keep-${id:0:8}-$(now)"
+  fi
   # 2. copy the history and the session folder (subagents, tool results) to the account that has quota.
   if ! copy_history "$history" "$target" "$id"; then
     log "ATTENTION session ${id:0:8}: copying the history to $(account_key "$target") failed; resume by hand with: cd $cwd && claude --resume $id"
@@ -430,7 +1191,9 @@ take_over() {
   fi
   # 3. start the fork in the single tmux server of the service.
   local started_window window_id name clone_id clone_pid pair
-  started_window=$(start_clone "$id" "$cwd" "$target" "$model" "$effort" "$permission" "$(takeover_message "$account" "$target" "$text")") || {
+  message=$(takeover_message "$account" "$target" "$text")
+  if $kept; then message+=$'\n'$(keep_message); fi
+  started_window=$(start_clone "$id" "$cwd" "$target" "$model" "$effort" "$permission" "$message" fork "$unit") || {
     log "ATTENTION session ${id:0:8}: the clone did not start in tmux; resume by hand with: cd $cwd && claude --resume $id"
     return 0
   }
@@ -440,8 +1203,10 @@ take_over() {
   if pair=$(discover_clone "$target" "$window_id" "$id"); then
     clone_id=${pair%% *}; clone_pid=${pair#* }
     log "session ${id:0:8}: clone ${clone_id:0:8} on $(account_key "$target"), window $name (pid $clone_pid)"
+    inherit_pin "$id" "$clone_id"
+    inherit_keep "$id" "$clone_id" "$target" "$clone_pid" "$window_id"
   else
-    log "ATTENTION session ${id:0:8}: the clone started in window $name but did not register its session; check with: $(attach_command)"
+    log "ATTENTION session ${id:0:8}: the clone started in window $name but did not register its session; check with: $(attach_command "$name")"
   fi
   sessions_rewrite '. + [$record]' --argjson record "$(jq -cn --arg original "$id" --arg from "$account" --arg clone "$clone_id" \
     --arg to "$target" --arg window "$name" --arg window_id "$window_id" --arg cwd "$cwd" --argjson at "$(now)" \
@@ -471,6 +1236,8 @@ refresh_clones() {
       if [[ -z $clone ]] && pair=$(discover_clone "$to" "$window_id" "$original" 1); then
         sessions_rewrite 'map(if .window_id == $w then .clone = $c else . end)' --arg w "$window_id" --arg c "${pair%% *}"
         log "clone of ${original:0:8} registered as ${pair%% *}"
+        inherit_pin "$original" "${pair%% *}"
+        inherit_keep "$original" "${pair%% *}" "$to" "${pair#* }" "$window_id"
       fi
     fi
   done < <(sessions_json | jq -c '.[] | select(.state == "running")')
@@ -499,7 +1266,7 @@ answer_prompt() {
   [[ $(cat -- "$marker" 2>/dev/null) != "$seen" ]] || return 0
   mkdir -p -- "$STATE/clones"
   printf '%s' "$seen" >"$marker"
-  log "ATTENTION clone of ${original:0:8} (window $(jq -r '.window' <<<"$record")) is waiting for a confirmation${rule:+ of $rule}; answer it in: $(attach_command)"
+  log "ATTENTION clone of ${original:0:8} (window $(jq -r '.window' <<<"$record")) is waiting for a confirmation${rule:+ of $rule}; answer it in: $(attach_command "$(jq -r '.window' <<<"$record")")"
 }
 
 live_clones() {
@@ -511,9 +1278,19 @@ live_clones() {
   printf '%s\n' "$count"
 }
 
+# Says once per session that a session an app hosts hit its limit and is left to that app.
+hosted_at_limit() { # ID ENTRYPOINT
+  local file="$STATE/hosted-at-limit"
+  ! grep -qx -- "$1" "$file" 2>/dev/null || return 0
+  printf '%s\n' "$1" >>"$file"
+  log "session ${1:0:8} is hosted by $2 and hit its usage limit: udarnik never closes a session an app hosts; the app resumes it (T3 Code: Resume after usage limits) or opens it again on another account"
+}
+
 serve_once() {
-  local line id state watched=0 limited=0 summary
+  local line id state entrypoint watched=0 limited=0 summary
   [[ ${UDARNIK_LINKS:-on} == off ]] || ensure_shared_links
+  accounts_forget_expired
+  weekly_observe
   refresh_clones
   udarnik_enabled || return 0
   while IFS= read -r line; do
@@ -524,8 +1301,16 @@ serve_once() {
     watched=$((watched + 1))
     [[ $state == limit ]] || continue
     limited=$((limited + 1))
+    # A session an app hosts (T3 Code: t3-code, the Agent SDK: sdk-ts...) is never closed or cloned: the app owns its
+    # process and conversation, and a clone in tmux would run the same session twice.
+    entrypoint=$(jq -r '.entrypoint // "cli"' <<<"$line")
+    if [[ $entrypoint != cli ]]; then
+      hosted_at_limit "$id" "$entrypoint"
+      continue
+    fi
     take_over "$line"
   done < <(scan_sessions)
+  revive_kept
   summary="$watched sessions watched, $limited at the limit, $(live_clones) live clones"
   if [[ $summary != "${LAST_SUMMARY:-}" ]]; then
     LAST_SUMMARY=$summary
@@ -536,7 +1321,11 @@ serve_once() {
 cmd_serve() {
   local once=false wake_pid=''
   [[ ${1:-} == --once ]] && once=true
-  export UDARNIK_LOG_STDOUT=1
+  # Not exported, even when it came exported: the tmux server, the clones and whatever they run (a runner calling
+  # `udarnik account`) never inherit it. The switch of older services, inherited by a shell inside one of their
+  # clones, goes too.
+  declare -g +x UDARNIK_LOG_JOURNAL=1
+  unset UDARNIK_LOG_STDOUT
   mkdir -p -- "$STATE/accounts" "$STATE/clones"
   # TERM (systemctl stop) and USR1 (a new switch or filter) both interrupt the wait at once.
   trap 'log "service received TERM; leaving"; exit 0' TERM
@@ -558,15 +1347,33 @@ cmd_serve() {
 
 # ---------------------------------------------------------------- viewing
 
-attach_command() { printf 'tmux -L %s attach -t %s\n' "$TMUX_SOCKET" "$TMUX_SESSION"; }
+# The command that attaches a terminal to the clones' tmux server, on WINDOW when one is given, ready to paste. A
+# command routed from another machine of the fleet carries UDARNIK_VIA (`ssh -t <this machine>`), so it works there.
+# A command routed through several machines carries UDARNIK_ORIGIN too: on the machine where the person is, the
+# command needs no ssh.
+attach_command() {
+  printf '%stmux -L %s attach -t %s%s\n' "$(via_prefix)" "$TMUX_SOCKET" "$TMUX_SESSION" "${1:+:$1}"
+}
 
-view_hint() { printf 'To see the sessions: udarnik view (or %s)\n' "$(attach_command)"; }
+via_prefix() {
+  [[ -n ${UDARNIK_VIA:-} ]] || return 0
+  [[ ${UDARNIK_ORIGIN:-} != "$(self_name)" ]] || return 0
+  printf '%s ' "$UDARNIK_VIA"
+}
+
+view_command() { if [[ -n $(via_prefix) ]]; then printf 'udarnik view --on %s\n' "$(self_name)"; else printf 'udarnik view\n'; fi; }
+
+view_hint() {
+  printf 'To see everything, paste in a terminal (Ctrl+b w switches window; Ctrl+b d leaves without ending anything):\n  %s\n' \
+    "$(attach_command)"
+}
 
 # The windows of the clones' tmux server and the Claude session each one runs, so the owner knows where to look.
 windows_json() {
   local listing window_id name dead pane pid account session
-  listing=$(tmux_cmd list-windows -t "$TMUX_SESSION" -F $'#{window_id}\t#{window_name}\t#{pane_dead}\t#{pane_pid}' 2>/dev/null) || listing=''
-  while IFS=$'\t' read -r window_id name dead pane; do
+  # Spaces, never tabs: tmux turns a tab into "_" when the locale is not UTF-8 (a bare ssh session). The name goes last.
+  listing=$(tmux_cmd list-windows -t "$TMUX_SESSION" -F '#{window_id} #{pane_dead} #{pane_pid} #{window_name}' 2>/dev/null) || listing=''
+  while IFS=' ' read -r window_id dead pane name; do
     [[ -n $window_id ]] || continue
     session=''
     if [[ $dead == 0 && -n $pane ]]; then
@@ -578,12 +1385,13 @@ windows_json() {
       done
     fi
     jq -cn --arg id "$window_id" --arg name "$name" --arg dead "$dead" --arg session "$session" \
-      '{id:$id, name:$name, alive:($dead == "0"), session:(if $session == "" then null else $session end)}'
+      --arg attach "$(attach_command "$name")" \
+      '{id:$id, name:$name, alive:($dead == "0"), session:(if $session == "" then null else $session end), attach:$attach}'
   done <<<"$listing" | jq -sc '.'
 }
 
-# Opens a terminal attached to the clones' tmux server: UDARNIK_TERMINAL (a command prefix), else xdg-terminal-exec,
-# else x-terminal-emulator. Fails when there is none.
+# Opens a terminal that runs COMMAND...: UDARNIK_TERMINAL (a command prefix), else xdg-terminal-exec, else
+# x-terminal-emulator. Fails when there is none.
 open_terminal() {
   local -a prefix=()
   if [[ -n ${UDARNIK_TERMINAL:-} ]]; then
@@ -594,7 +1402,19 @@ open_terminal() {
     prefix=(x-terminal-emulator -e)
   fi
   ((${#prefix[@]})) && command -v "${prefix[0]}" >/dev/null 2>&1 || return 1
-  setsid -f "${prefix[@]}" tmux -L "$TMUX_SOCKET" attach -t "$TMUX_SESSION" </dev/null >/dev/null 2>&1
+  setsid -f "${prefix[@]}" "$@" </dev/null >/dev/null 2>&1
+}
+
+# Opens a terminal on ATTACH (a command line) when there is a display and PRINT is false; prints it otherwise.
+show_attach() {
+  local attach=$1 print=$2
+  local -a words
+  IFS=' ' read -ra words <<<"$attach"
+  if ! $print && [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]] && open_terminal "${words[@]}"; then
+    note "Opened a terminal on the udarnik tmux. Switch window: Ctrl+b w. Leave without ending anything: Ctrl+b d or close the terminal."
+  else
+    note "To see: $attach"
+  fi
 }
 
 # Opens a terminal on the window that runs WINDOW (a window name or id, or the start of a session id). Without a
@@ -619,19 +1439,40 @@ cmd_view() {
     [[ -n $target ]] || die "no udarnik window matches $wanted; see: udarnik status"
     tmux_cmd select-window -t "$target"
   fi
-  if ! $print && [[ -n ${WAYLAND_DISPLAY:-}${DISPLAY:-} ]] && open_terminal; then
-    note "Opened a terminal on the udarnik tmux. Switch window: Ctrl+b w. Leave without ending anything: Ctrl+b d or close the terminal."
-  else
-    note "To see: $(attach_command)"
+  show_attach "$(attach_command)" "$print"
+}
+
+# view --on MACHINE: the attach command of that machine's tmux, through ssh, opened here.
+view_remote() {
+  local name=$1 destination=$2 print=false wanted='' data attach
+  shift 2
+  while (($#)); do
+    case "$1" in
+      --print) print=true ;;
+      -*) die "unknown view option: $1" ;;
+      *) wanted=$1 ;;
+    esac
+    shift
+  done
+  data=$(REMOTE_TIMEOUT=60 remote_udarnik "$destination" status --json </dev/null) || die "could not reach $name"
+  if jq -e '.view.windows | length == 0' >/dev/null <<<"$data"; then
+    note "No session in the udarnik tmux of $name right now; nothing to see."
+    return 0
   fi
+  attach=$(jq -r --arg w "$wanted" 'if $w == "" then .view.attach else
+    ([.view.windows[] | select(.name == $w or .id == $w or ((.session // "") | startswith($w)))][0].attach // empty) end' <<<"$data")
+  [[ -n $attach ]] || die "no udarnik window on $name matches $wanted; see: udarnik status --on $name"
+  show_attach "$attach" "$print"
 }
 
 # ---------------------------------------------------------------- status
 
-# Live headless claude processes (-p / --print) and the account each one runs on. When /proc hides a process
-# (non-dumpable), its account and folder are null instead of an error.
+# Live headless claude processes (-p / --print) and the account each one runs on, then the live sessions registered
+# with a headless entrypoint that ps did not give (same pid never twice). When /proc hides a process (non-dumpable),
+# its account and folder come from its registry file if it has one, and are null when neither source knows.
 worker_processes() {
-  local pid comm cmdline argv0 exe environ account cwd
+  local pid comm cmdline argv0 exe environ account cwd file entrypoint registered
+  local -A seen=()
   while IFS=' ' read -r pid comm; do
     [[ $pid =~ ^[0-9]+$ ]] || continue
     [[ $comm == claude || $comm =~ ^[0-9]+(\.[0-9]+)+$ ]] || continue
@@ -649,31 +1490,102 @@ worker_processes() {
       account=${account%/}
     fi
     cwd=$(readlink "/proc/$pid/cwd" 2>/dev/null || true)
+    if [[ -z $account ]]; then
+      # /proc hid the environment: the registry, when this pid has one, knows the account and the folder
+      while IFS= read -r registered; do
+        [[ -n $registered && -f $registered/sessions/$pid.json ]] || continue
+        pid_matches "$pid" "$(jq -r '.procStart // empty' "$registered/sessions/$pid.json" 2>/dev/null)" || continue
+        account=$registered
+        [[ -n $cwd ]] || cwd=$(jq -r '.cwd // empty' "$registered/sessions/$pid.json" 2>/dev/null || true)
+        break
+      done < <(accounts_list)
+    fi
+    seen[$pid]=1
     jq -cn --argjson pid "$pid" --arg account "$account" --arg cwd "$cwd" \
       '{pid:$pid, account:(if $account == "" then null else $account end), cwd:(if $cwd == "" then null else $cwd end)}'
   done < <(ps -eo pid=,comm= | sed -E 's/^[[:space:]]+//')
-}
-
-status_json() {
-  local active=false enabled=false accounts='[]' sessions clones='[]' workers tail_lines context only='[]' windows root
-  local account key until percent cache age record alive
-  service_active && active=true
-  udarnik_enabled && enabled=true
   while IFS= read -r account; do
     [[ -n $account ]] || continue
-    key=$(account_key "$account"); until=$(account_out_until "$account"); percent=$(account_weekly_percent "$account")
+    for file in "$account"/sessions/*.json; do
+      [[ -f $file ]] || continue
+      IFS=$'\t' read -r pid cwd entrypoint < <(jq -r '[.pid, (.cwd // "-"), (.entrypoint // "")] | @tsv' "$file" 2>/dev/null) || continue
+      [[ $pid =~ ^[0-9]+$ && -z ${seen[$pid]:-} ]] || continue
+      is_headless_entrypoint "$entrypoint" || continue
+      pid_matches "$pid" "$(jq -r '.procStart // empty' "$file" 2>/dev/null)" || continue
+      seen[$pid]=1
+      jq -cn --argjson pid "$pid" --arg account "$account" --arg cwd "$cwd" \
+        '{pid:$pid, account:$account, cwd:(if $cwd == "-" or $cwd == "" then null else $cwd end)}'
+    done
+  done < <(accounts_list)
+}
+
+# Every account of this machine as a JSON array, from files only: identity, login (.credentials.json), onboarding,
+# quota, and the newest weekly usage known with its age and the machine it came from.
+accounts_json() {
+  local account until news_at news_from cache age weekly self
+  self=$(self_name)
+  while IFS= read -r account; do
+    [[ -n $account ]] || continue
+    until=$(account_out_until "$account")
+    news_at='' news_from=''
+    IFS=' ' read -r news_at news_from <<<"$(account_out_news "$account")" || true
     cache=$(_usage_cache_file "$account")
     age=''
     [[ -f $cache ]] && age=$(( $(now) - $(stat -c %Y -- "$cache") ))
-    accounts=$(jq -c --arg path "$account" --arg key "$key" --argjson until "$until" --arg percent "$percent" --arg age "$age" \
-      --argjson now "$(now)" '. + [{key:$key, path:$path, available:($until <= $now),
+    weekly=$(account_weekly "$account")
+    jq -cn --arg path "$account" --arg key "$(account_key "$account")" --argjson until "$until" --arg age "$age" \
+      --arg identity "$(account_identity "$account")" --argjson weekly "${weekly:-null}" --arg self "$self" \
+      --arg news_at "$news_at" --arg news_from "$news_from" \
+      --argjson logged_in "$([[ -f $account/.credentials.json ]] && echo true || echo false)" \
+      --argjson onboarded "$(account_onboarded "$account" && echo true || echo false)" \
+      --argjson now "$(now)" '{key:$key, path:$path, identity:(if $identity == "" then null else $identity end),
+        logged_in:$logged_in, onboarded:$onboarded,
+        available:($until <= $now),
         out_until:(if $until > $now then $until else null end),
         out_until_local:(if $until > $now then ($until | strflocaltime("%d/%m %H:%M")) else null end),
-        weekly_percent:(if $percent == "" then null else ($percent | tonumber) end),
-        cache_age_seconds:(if $age == "" then null else ($age | tonumber) end)}]' <<<"$accounts")
-  done < <(accounts_list)
-  sessions=$(scan_sessions | jq -sc --argjson now "$(now)" 'map({pid, id, short:.id[0:8], account, cwd,
-    title:(.probe.title // ""), state,
+        out_news_at:(if $until > $now and $news_at != "" then ($news_at | tonumber) else null end),
+        out_from:(if $until > $now and $news_at != "" then (if $news_from == "" then $self else $news_from end) else null end),
+        weekly_percent:($weekly.percent // null),
+        weekly_resets_at:($weekly.resets_at // null),
+        weekly_at:($weekly.at // null),
+        weekly_age_seconds:(if $weekly then ([$now - $weekly.at, 0] | max) else null end),
+        weekly_from:(if $weekly then (if $weekly.from == "" then $self else $weekly.from end) else null end),
+        cache_age_seconds:(if $age == "" then null else ($age | tonumber) end)}'
+  done < <(accounts_list) | jq -sc '.'
+}
+
+# The kept sessions with what the board shows: whether they run, their scope, how many times they came back.
+kept_status_json() {
+  local record history title alive
+  while IFS= read -r record; do
+    [[ -n $record ]] || continue
+    alive=false
+    ! kept_alive "$record" || alive=true
+    title=''
+    if history=$(history_file "$(jq -r '.account' <<<"$record")" "$(jq -r '.cwd' <<<"$record")" "$(jq -r '.id' <<<"$record")"); then
+      title=$(python3 -I "$PROBE" "$history" 2>/dev/null | jq -r '.title // ""') || title=''
+    fi
+    jq -c --argjson alive "$alive" --arg title "$title" --argjson now "$(now)" '{id, short:.id[0:8], account, cwd, title:$title,
+      alive:$alive, pid, scope:(if (.scope // "") == "" then null else .scope end),
+      resumed:([(.resumes // [])[] | select(. > $now - 3600)] | length),
+      last_resumed:((.resumes // []) | max // null),
+      last_resumed_local:((.resumes // []) | max // null | if . then strflocaltime("%d/%m %H:%M") else null end)}' <<<"$record"
+  done < <(kept_json | jq -c '.[]') | jq -sc '.'
+}
+
+status_json() {
+  local active=false enabled=false runners=false accounts sessions clones='[]' moved workers waiting tail_lines context only='[]'
+  local windows root record alive pins kept
+  service_active && active=true
+  udarnik_enabled && enabled=true
+  udarnik_runners_enabled && runners=true
+  weekly_observe
+  accounts=$(accounts_json)
+  pins=$(pins_json)
+  kept=$(kept_status_json)
+  sessions=$(scan_sessions | jq -sc --argjson now "$(now)" --argjson pins "$pins" --argjson kept "$kept" 'map({pid, id, short:.id[0:8], account, cwd,
+    title:(.probe.title // ""), state, pinned:(.id as $id | any($pins[]; . as $p | $id | startswith($p))),
+    kept:(.id as $id | any($kept[]; .id == $id)),
     stopped_seconds:(if .state == "limit"
       then ($now - ((.probe.timestamp // "") | sub("\\.[0-9]+Z$"; "Z") | try fromdateiso8601 catch $now))
       else ($now - ((.updated // 0) / 1000 | floor)) end)})')
@@ -681,10 +1593,19 @@ status_json() {
     [[ -n $record ]] || continue
     alive=false
     [[ $(window_state "$(jq -r '.window_id' <<<"$record")") == alive ]] && alive=true
-    clones=$(jq -c --argjson record "$record" --argjson alive "$alive" \
-      '. + [$record + {alive:$alive, at_local:($record.at | strflocaltime("%d/%m %H:%M"))}]' <<<"$clones")
+    clones=$(jq -c --argjson record "$record" --argjson alive "$alive" --argjson pins "$pins" \
+      '. + [$record + {alive:$alive, at_local:($record.at | strflocaltime("%d/%m %H:%M")),
+        pinned:(($record.clone // "") as $id | $id != "" and any($pins[]; . as $p | $id | startswith($p)))}]' <<<"$clones")
   done < <(sessions_json | jq -c '.[] | select(.state == "running")')
+  # Sessions that left for another machine in the last week, with the command that attaches to them there, from where
+  # the person is: nothing to add on that machine itself, else ssh to it.
+  moved=$(sessions_json | jq -c --argjson since "$(( $(now) - 7 * 86400 ))" --arg origin "${UDARNIK_ORIGIN:-}" \
+    --argjson destinations "$(fleet_machines | jq -Rsc 'split("\n") | map(select(length > 0) | split("\t") | {(.[0]):.[1]}) | add // {}')" \
+    '[.[] | select(.state == "moved" and .at >= $since) | . + {at_local:(.at | strflocaltime("%d/%m %H:%M"))}
+      | if .attach_local == null then . elif .machine == $origin then .attach = .attach_local
+        else .attach = "ssh -t \($destinations[.machine] // .machine) \(.attach_local)" end]')
   workers=$(worker_processes | jq -sc '.')
+  waiting=$(waits_json)
   windows=$(windows_json)
   tail_lines=$(tail -n 10 -- "$STATE/udarnik.log" 2>/dev/null | jq -Rsc 'split("\n") | map(select(length > 0))')
   context=$(cat -- "$STATE/context" 2>/dev/null || true)
@@ -693,10 +1614,55 @@ status_json() {
   jq -cn --argjson active "$active" --argjson enabled "$enabled" --arg unit "$UNIT" --arg context "$context" --argjson only "$only" \
     --argjson accounts "$accounts" --argjson sessions "$sessions" --argjson clones "$clones" --argjson workers "$workers" \
     --argjson log "$tail_lines" --arg root "$root" --argjson windows "$windows" --arg attach "$(attach_command)" \
-    '{service:{unit:$unit, active:$active}, enabled:$enabled, context:$context, only:$only,
-      root:(if $root == "" then null else $root end), accounts:$accounts,
-      sessions:$sessions, clones:$clones, workers:$workers,
-      view:{open:"udarnik view", attach:$attach, windows:$windows}, log:$log}'
+    --argjson moved "$moved" --arg machine "$(self_name)" --arg open "$(view_command)" --argjson runners "$runners" \
+    --argjson pins "$pins" --argjson waiting "$waiting" --argjson kept "$kept" \
+    '{machine:$machine, service:{unit:$unit, active:$active}, enabled:$enabled, runners:$runners, context:$context, only:$only,
+      root:(if $root == "" then null else $root end), pinned:$pins, accounts:$accounts,
+      sessions:$sessions, clones:$clones, kept:$kept, moved:$moved, workers:$workers, waiting:$waiting,
+      view:{open:$open, attach:$attach, windows:$windows}, log:$log}'
+}
+
+# The board of one machine's status JSON, without the closing hint.
+render_status() {
+  local data=$1
+  printf 'Service %s: %s · switch: %s\n' "$(jq -r '.service.unit' <<<"$data")" \
+    "$(jq -r 'if .service.active then "active" else "stopped" end' <<<"$data")" \
+    "$(jq -r 'if .enabled then "on" else "off" end' <<<"$data")"
+  jq -r '"Account switching for runners: " + (if .runners == true then "on" elif .runners == false then "off" else "unknown" end),
+    if (.only | length) > 0 then "Only: " + (.only | join(", ")) else empty end,
+    if .root != null then "Root: " + .root else empty end,
+    if .context != "" then "Context: " + .context else empty end' <<<"$data"
+  printf '\nAccounts\n'
+  jq -r 'def age: if . < 60 then "\(.)s" elif . < 3600 then "\(. / 60 | floor) min" elif . < 86400 then "\(. / 3600 | floor) h"
+      else "\(. / 86400 | floor) d" end;
+    .accounts[] | "  \(.key): " + (if .available then "available" else "out until \(.out_until_local)" end)
+    + (if .weekly_percent != null then " · weekly \(.weekly_percent)%"
+        + (if .weekly_age_seconds != null then " (\(.weekly_age_seconds | age) old, from \(.weekly_from))" else "" end)
+      else "" end)' <<<"$data"
+  printf '\nWatched sessions\n'
+  jq -r '.sessions[] | "  \(.pid)  \(.short)  \(.account | split("/") | last | ltrimstr("."))  \(.state)\(if .pinned then "  pinned" else "" end)\(if .kept then "  kept" else "" end)  \(.stopped_seconds)s  \(.title)"' <<<"$data"
+  printf '\nClones\n'
+  jq -r '.clones[] | "  \(.original[0:8]) -> \((.clone // "")[0:8])  \(.to | split("/") | last | ltrimstr("."))  window \(.window)  \(if .alive then "alive" else "stopped" end)  since \(.at_local)"
+    + (if .pinned then "  pinned" else "" end) + (if .came_from then "  (came from \(.came_from))" else "" end)' <<<"$data"
+  if jq -e '(.kept // []) | length > 0' >/dev/null <<<"$data"; then
+    printf '\nKept sessions\n'
+    jq -r '.kept[] | "  \(.short)  \(.account | split("/") | last | ltrimstr("."))  \(if .alive then "alive" else "stopped" end)  scope \(.scope // "none")"
+      + (if .resumed > 0 then "  resumed \(.resumed)x in the last hour (last \(.last_resumed_local))" else "" end)
+      + (if .title != "" then "  \(.title)" else "" end)' <<<"$data"
+  fi
+  if jq -e '(.moved // []) | length > 0' >/dev/null <<<"$data"; then
+    printf '\nMoved to other machines\n'
+    jq -r '.moved[] | "  \(.original[0:8]) -> \(.machine)  \((.clone // "")[0:8])  \(.to | split("/") | last | ltrimstr("."))  window \(.window)  since \(.at_local)\n    \(.attach)"' <<<"$data"
+  fi
+  printf '\ntmux windows\n'
+  jq -r '.view.windows[] | "  \(.id)  \(.name)  \(if .alive then "alive" else "stopped" end)" + (if .session then "  session \(.session[0:8])" else "" end)
+    + (if .alive then "\n    \(.attach)" else "" end)' <<<"$data"
+  printf '\nWorkers (headless claude)\n'
+  jq -r '.workers[] | "  pid \(.pid)  account \(if .account then (.account | split("/") | last | ltrimstr(".")) else "unknown" end)  \(.cwd // "")"' <<<"$data"
+  printf '\nRunners waiting for quota\n'
+  jq -r '(.waiting // [])[] | "  pid \(.pid)  until \(.until_local)  \(.label)  \(.cwd)"' <<<"$data"
+  printf '\nLast log lines\n'
+  jq -r '.log[] | "  " + .' <<<"$data"
 }
 
 cmd_status() {
@@ -708,36 +1674,520 @@ cmd_status() {
   esac
   data=$(status_json)
   if $json; then printf '%s\n' "$data"; return 0; fi
-  printf 'Service %s: %s · switch: %s\n' "$UNIT" "$(jq -r 'if .service.active then "active" else "stopped" end' <<<"$data")" \
-    "$(jq -r 'if .enabled then "on" else "off" end' <<<"$data")"
-  jq -r 'if (.only | length) > 0 then "Only: " + (.only | join(", ")) else empty end,
-    if .root != null then "Root: " + .root else empty end,
-    if .context != "" then "Context: " + .context else empty end' <<<"$data"
-  printf '\nAccounts\n'
-  jq -r '.accounts[] | "  \(.key): " + (if .available then "available" else "out until \(.out_until_local)" end)
-    + (if .weekly_percent != null then " · weekly \(.weekly_percent)%" else "" end)' <<<"$data"
-  printf '\nWatched sessions\n'
-  jq -r '.sessions[] | "  \(.pid)  \(.short)  \(.account | split("/") | last | ltrimstr("."))  \(.state)  \(.stopped_seconds)s  \(.title)"' <<<"$data"
-  printf '\nClones\n'
-  jq -r '.clones[] | "  \(.original[0:8]) -> \((.clone // "")[0:8])  \(.to | split("/") | last | ltrimstr("."))  window \(.window)  \(if .alive then "alive" else "stopped" end)  since \(.at_local)"' <<<"$data"
-  printf '\ntmux windows\n'
-  jq -r '.view.windows[] | "  \(.id)  \(.name)  \(if .alive then "alive" else "stopped" end)" + (if .session then "  session \(.session[0:8])" else "" end)' <<<"$data"
-  printf '\nWorkers (headless claude)\n'
-  jq -r '.workers[] | "  pid \(.pid)  account \(if .account then (.account | split("/") | last | ltrimstr(".")) else "unknown" end)  \(.cwd // "")"' <<<"$data"
-  printf '\nLast log lines\n'
-  jq -r '.log[] | "  " + .' <<<"$data"
+  render_status "$data"
   printf '\n%s\n' "$(view_hint)"
 }
 
+# ---------------------------------------------------------------- fleet
+
+# The machines this one works with: the "machines" of the fleet file, the one stakhanov's `campaign fleet` keeps:
+#   {"machines": {NAME: {"ssh": DESTINATION, "id": MACHINE_ID}}, "projects": {NAME: {"paths": {MACHINE: PATH}}}}
+# Without the file udarnik works on this machine only and never uses the network.
+FLEET_FILE=${UDARNIK_FLEET:-${AGENTIC_FLEET:-${XDG_CONFIG_HOME:-$HOME/.config}/agentic/fleet.json}}
+
+machine_id() {
+  local id=${UDARNIK_MACHINE_ID:-${AGENTIC_MACHINE_ID:-}}
+  [[ -n $id ]] || id=$(cat /etc/machine-id 2>/dev/null || cat /var/lib/dbus/machine-id 2>/dev/null || true)
+  printf '%s\n' "$id"
+}
+
+# NAME<TAB>DESTINATION<TAB>true|false (this machine) for every machine of the fleet file.
+fleet_machines() {
+  [[ -f $FLEET_FILE ]] || return 0
+  jq -r --arg id "$(machine_id)" '(.machines // {}) | to_entries[]
+    | [.key, (.value.ssh // .key), ($id != "" and .value.id == $id)] | @tsv' "$FLEET_FILE" 2>/dev/null || true
+}
+
+has_fleet() { [[ -n $(fleet_machines) ]]; }
+
+# This machine's name in the fleet, else its host name.
+self_name() {
+  local name destination self
+  while IFS=$'\t' read -r name destination self; do
+    [[ $self != true ]] || { printf '%s\n' "$name"; return 0; }
+  done < <(fleet_machines)
+  uname -n | cut -d. -f1
+}
+
+is_self() { [[ $1 == "$(self_name)" ]]; }
+
+machine_destination() {
+  local name destination self
+  while IFS=$'\t' read -r name destination self; do
+    [[ $name != "$1" ]] || { printf '%s\n' "$destination"; return 0; }
+  done < <(fleet_machines)
+  return 1
+}
+
+# Runs udarnik ARGS on the machine at DESTINATION over ssh (UDARNIK_SSH, word-split); stdin goes through. What it
+# prints for a person to paste (attach commands) goes through `ssh -t DESTINATION`. REMOTE_TIMEOUT bounds the call.
+remote_udarnik() {
+  local destination=$1 command
+  shift
+  local -a ssh limit=()
+  IFS=' ' read -ra ssh <<<"${UDARNIK_SSH:-ssh -o BatchMode=yes -o ConnectTimeout=10}"
+  [[ -z ${REMOTE_TIMEOUT:-} ]] || limit=(timeout "$REMOTE_TIMEOUT")
+  command="export PATH=\"\$PATH:\$HOME/.local/bin\" UDARNIK_VIA=$(printf %q "ssh -t $destination")"
+  command+=" UDARNIK_ORIGIN=$(printf %q "${UDARNIK_ORIGIN:-$(self_name)}"); exec udarnik$(printf ' %q' "$@")"
+  "${limit[@]}" "${ssh[@]}" "$destination" "$command"
+}
+
+# Runs `udarnik ARGS...` on every other machine of the fleet, so that it learns WHAT. In the background
+# (UDARNIK_SHARE_WAIT=1: in the foreground); nothing without a fleet file. A machine that does not answer is logged.
+fleet_tell() {
+  has_fleet || return 0
+  if [[ ${UDARNIK_SHARE_WAIT:-0} == 1 ]]; then
+    fleet_tell_now "$@"
+  else
+    setsid -f "$SCRIPT_DIR/udarnik" _tell "$@" </dev/null >/dev/null 2>&1 || true
+  fi
+}
+
+fleet_tell_now() {
+  local what=$1 name destination self
+  shift
+  while IFS=$'\t' read -r name destination self; do
+    [[ $self != true ]] || continue
+    REMOTE_TIMEOUT=60 remote_udarnik "$destination" "$@" </dev/null >/dev/null 2>&1 \
+      || log "could not tell $name $what (unreachable)"
+  done < <(fleet_machines)
+}
+
+# Tells every other machine of the fleet that ACCOUNT is out until EPOCH, so its runners and its takeover skip that
+# account too. The news carries its time and this machine's name: a later news from here replaces it, and between
+# machines the later epoch wins (see _learn_out_until).
+# The time of the news is the one account_mark_out stored here, not a new reading of the clock: the two readings can
+# fall on either side of a second, and the other machine would record a time this one never had.
+share_out() {
+  local account=$1 epoch=$2 at='' from=''
+  has_fleet || return 0
+  IFS=' ' read -r at from <<<"$(account_out_news "$account")" || true
+  [[ -z $from ]] || at=''
+  [[ $at =~ ^[0-9]+$ ]] || at=$(now)
+  fleet_tell "that account $(account_key "$account") is out of quota" \
+    account learn "$(account_identity "$account")" "$(account_key "$account")" "$epoch" "$(self_name)" "$at"
+}
+
+# Tells every other machine of the fleet that a call worked in ACCOUNT at AT, so it drops the out-until it learned
+# before that time. The news carries this machine's name: it is ignored when it comes back here.
+share_clear() {
+  local account=$1 at=$2
+  has_fleet || return 0
+  fleet_tell "that account $(account_key "$account") is back" \
+    account learn-clear "$(account_identity "$account")" "$(account_key "$account")" "$at" "$(self_name)"
+}
+
+# Stores the weekly usage this machine reads in the usage file of each account when it is newer than the one known,
+# and tells the other machines of the fleet when it changed, at most once every 10 minutes per account.
+weekly_observe() {
+  local account record share=''
+  has_fleet && share=share
+  while IFS= read -r account; do
+    [[ -n $account ]] || continue
+    record=$(account_weekly_observe "$account" "$share") || continue
+    fleet_tell "the weekly usage of account $(account_key "$account")" \
+      account learn-weekly "$(account_identity "$account")" "$(account_key "$account")" "$(jq -r '.percent' <<<"$record")" \
+      "$(jq -r '.resets_at // ""' <<<"$record")" "$(jq -r '.at' <<<"$record")" "$(self_name)"
+  done < <(accounts_list)
+}
+
+# --out arguments that hand the accounts out of quota here to another machine: "IDENTITY KEY EPOCH AT FROM", the time
+# and the machine of that news.
+out_arguments() {
+  local account until at from self
+  self=$(self_name)
+  while IFS= read -r account; do
+    [[ -n $account ]] || continue
+    until=$(account_out_until "$account")
+    ((until > $(now))) || continue
+    at='' from=''
+    IFS=' ' read -r at from <<<"$(account_out_news "$account")" || true
+    printf '%s\n' --out "$(account_identity "$account") $(account_key "$account") $until${at:+ $at ${from:-$self}}"
+  done < <(accounts_list)
+}
+
+learn_out_argument() { # "IDENTITY KEY EPOCH [AT FROM]" FROM
+  local identity key epoch at origin account
+  local -a fields
+  IFS=' ' read -ra fields <<<"$1"
+  [[ ${fields[0]:-} == */* ]] || fields=('' "${fields[@]}")
+  identity=${fields[0]} key=${fields[1]:-} epoch=${fields[2]:-} at=${fields[3]:-} origin=${fields[4]:-$2}
+  # What this machine marked itself comes back from the others, with its own name as origin: it already has it.
+  [[ $origin != "$(self_name)" ]] || return 0
+  account=$(account_matching "$identity" "$key") || return 0
+  if account_learn_out "$account" "$epoch" "$at" "$origin"; then
+    log "account $(account_key "$account") is out of quota until $(local_time "$epoch") (learned from $origin)"
+  fi
+}
+
+# The folder on MACHINE that is CWD here: the same place inside a project the fleet file maps on both machines, else
+# the same path.
+map_path() {
+  local cwd=$1 machine=$2 mapped=''
+  [[ ! -f $FLEET_FILE ]] || mapped=$(jq -r --arg cwd "$cwd" --arg self "$(self_name)" --arg to "$machine" '
+    [(.projects // {})[] | (.paths // {}) | select(.[$self] and .[$to])
+      | {from:(.[$self] | rtrimstr("/")), to:(.[$to] | rtrimstr("/"))}
+      | select(.from as $from | $cwd == $from or ($cwd | startswith($from + "/")))]
+    | sort_by(.from | length) | last // empty | . as $m | $m.to + ($cwd | ltrimstr($m.from))' "$FLEET_FILE" 2>/dev/null) || mapped=''
+  printf '%s\n' "${mapped:-$cwd}"
+}
+
+# The status of every machine of the fleet, gathered over ssh at once. An unreachable machine shows the last status
+# seen from here (fleet-seen.json), with its age. Accounts another machine knows to be out are learned here.
+fleet_status_json() {
+  local folder name destination self out seen_file seen at
+  folder=$(mktemp -d "${TMPDIR:-/tmp}/udarnik-fleet.XXXXXX")
+  seen_file="$STATE/fleet-seen.json"
+  mkdir -p -- "$STATE"
+  if ! has_fleet; then
+    status_json | jq -c --arg name "$(self_name)" '{machines:[{name:$name, self:true, reachable:true, seen_at:null, status:.}]}'
+    rm -rf -- "$folder"; return 0
+  fi
+  while IFS=$'\t' read -r name destination self; do
+    if [[ $self == true ]]; then
+      status_json >"$folder/$name.json" 2>/dev/null &
+    else
+      REMOTE_TIMEOUT=${UDARNIK_FLEET_TIMEOUT:-30} remote_udarnik "$destination" status --json </dev/null >"$folder/$name.json" 2>/dev/null &
+    fi
+  done < <(fleet_machines)
+  wait
+  seen=$(cat -- "$seen_file" 2>/dev/null || true)
+  jq -e 'type == "object"' >/dev/null 2>&1 <<<"$seen" || seen='{}'
+  out='[]'; at=$(now)
+  while IFS=$'\t' read -r name destination self; do
+    if jq -e '.accounts' "$folder/$name.json" >/dev/null 2>&1; then
+      seen=$(jq -c --arg name "$name" --argjson at "$at" --slurpfile status "$folder/$name.json" '.[$name] = {at:$at, status:$status[0]}' <<<"$seen")
+      out=$(jq -c --arg name "$name" --argjson self "$self" --slurpfile status "$folder/$name.json" \
+        '. + [{name:$name, self:$self, reachable:true, seen_at:null, status:$status[0]}]' <<<"$out")
+      [[ $self == true ]] || learn_from_status "$folder/$name.json" "$name"
+    else
+      out=$(jq -c --arg name "$name" --argjson self "$self" --argjson seen "$seen" \
+        '. + [{name:$name, self:$self, reachable:false,
+          seen_at:($seen[$name].at // null),
+          seen_at_local:(if $seen[$name].at then ($seen[$name].at | strflocaltime("%d/%m %H:%M")) else null end),
+          status:($seen[$name].status // null)}]' <<<"$out")
+    fi
+  done < <(fleet_machines)
+  printf '%s\n' "$seen" >"$seen_file.new" && mv -f -- "$seen_file.new" "$seen_file"
+  rm -rf -- "$folder"
+  jq -c '{machines:sort_by(if .self then 0 else 1 end)}' <<<"$out"
+}
+
+# What another machine's status says about the accounts: which are out of quota, and the weekly usage it knows.
+learn_from_status() {
+  local file=$1 from=$2 identity key until at origin percent resets account
+  # Fields separated by US (0x1f), which unlike a tab never merges with an empty field next to it.
+  while IFS=$'\x1f' read -r identity key until at origin; do
+    [[ -n $key ]] || continue
+    learn_out_argument "${identity:+$identity }$key $until${at:+ $at ${origin:-$from}}" "$from"
+  done < <(jq -r '.accounts[] | select(.out_until != null)
+    | [(.identity // ""), .key, .out_until, (.out_news_at // ""), (.out_from // "")] | map(tostring) | join("\u001f")' "$file" 2>/dev/null)
+  while IFS=$'\x1f' read -r identity key percent resets at origin; do
+    # What this machine read itself comes back from the others: it already has it.
+    [[ -n $key && ${origin:-$from} != "$(self_name)" ]] || continue
+    account=$(account_matching "$identity" "$key") || continue
+    account_learn_weekly "$account" "$percent" "$resets" "$at" "${origin:-$from}" || true
+  done < <(jq -r '.accounts[] | select(.weekly_percent != null and .weekly_at != null)
+    | [(.identity // ""), .key, .weekly_percent, (.weekly_resets_at // ""), .weekly_at, (.weekly_from // "")]
+    | map(tostring) | join("\u001f")' "$file" 2>/dev/null)
+}
+
+cmd_fleet_status() {
+  local json=false data count index
+  case "${1:-}" in
+    '') ;;
+    --json) json=true ;;
+    *) die "unknown status option: $1" ;;
+  esac
+  data=$(fleet_status_json)
+  if $json; then printf '%s\n' "$data"; return 0; fi
+  count=$(jq '.machines | length' <<<"$data")
+  for ((index = 0; index < count; index++)); do
+    jq -r --argjson i "$index" '.machines[$i] | "== \(.name)" + (if .self then " (this machine)" elif .reachable then ""
+      elif .seen_at_local then " (unreachable; last seen \(.seen_at_local))" else " (unreachable; never seen from here)" end)' <<<"$data"
+    if jq -e --argjson i "$index" '.machines[$i].status != null' >/dev/null <<<"$data"; then
+      render_status "$(jq -c --argjson i "$index" '.machines[$i].status' <<<"$data")"
+    fi
+    printf '\n'
+  done
+  printf 'To see the sessions of a machine: udarnik view --on MACHINE (or paste its attach command above).\n'
+}
+
+# start, stop or runners on every machine of the fleet, one block per machine.
+fleet_each() {
+  local command=$1 name destination self status=0
+  shift
+  if ! has_fleet; then "cmd_$command" "$@"; return; fi
+  while IFS=$'\t' read -r name destination self; do
+    printf '== %s\n' "$name"
+    if [[ $self == true ]]; then
+      ( "cmd_$command" "$@" ) || status=1
+    else
+      REMOTE_TIMEOUT=60 remote_udarnik "$destination" "$command" "$@" </dev/null || { printf 'udarnik: %s did not answer or failed\n' "$name"; status=1; }
+    fi
+    printf '\n'
+  done < <(fleet_machines)
+  return "$status"
+}
+
+# ---------------------------------------------------------------- moving a session to another machine
+
+# PID: true when PID is this process or one of its ancestors. Looked for downwards, among the descendants of PID,
+# never upwards: what is above this process (the shell, the terminal, the service that started it) is not looked at.
+is_ancestor() {
+  local below
+  [[ $1 =~ ^[0-9]+$ ]] || return 1
+  below=$(descendants "$1")
+  grep -qx -- "$$" <<<"$below"
+}
+
+move_message() {
+  local from=$1 from_cwd=$2 here=$3 cwd=$4 account=$5 reason=$6 context=''
+  [[ ! -s $STATE/context ]] || context=$(cat -- "$STATE/context")
+  printf 'This session is a fork moved from machine %s (folder %s) to machine %s (folder %s), on account %s, because %s.\n' \
+    "$from" "$from_cwd" "$here" "$cwd" "$(account_label "$account")" "$reason"
+  printf 'You are a copy of the previous session, which was closed there. Only the conversation came along: changes that were not committed and pushed on %s, builders, subagents, background tasks and messages between sessions did not. Before relaunching anything, check the real state here: git (fetch from %s what is missing), worktrees, processes and logs.\n' "$from" "$from"
+  printf "Continue where it stopped, following the owner's orders in the conversation.\n"
+  [[ -z $context ]] || printf 'Owner context: %s\n' "$context"
+}
+
+# Moves a live session (a scan line) to MACHINE: the other machine first checks that it can take it (the folder exists
+# there and an account has quota), then the session is closed here, its history goes there over ssh and a fork is
+# resumed in that machine's tmux. Prints the other machine's answer (JSON). Status 1: nothing was done; 2: the
+# session was closed here but did not start there (logged with ATTENTION and how to resume it by hand).
+move_session() {
+  local line=$1 machine=$2 destination=$3 reason=$4
+  local account pid id cwd history probe model effort permission target_cwd identity key answer source_dir kept_before
+  local -a outs members
+  account=$(jq -r '.account' <<<"$line"); pid=$(jq -r '.pid' <<<"$line"); id=$(jq -r '.id' <<<"$line")
+  if is_pinned "$id"; then
+    log "session ${id:0:8}: pinned to $(self_name), so it does not move to $machine"
+    pinned_refusal "$id" >&2
+    return 1
+  fi
+  cwd=$(jq -r '.cwd' <<<"$line"); history=$(jq -r '.history' <<<"$line"); probe=$(jq -c '.probe' <<<"$line")
+  model=$(jq -r '.model // empty' <<<"$probe"); effort=$(jq -r '.effort // empty' <<<"$probe")
+  permission=$(jq -r '.permission_mode // empty' <<<"$probe")
+  [[ -z $effort ]] || [[ $effort =~ ^(low|medium|high|xhigh|max)$ ]] || effort=''
+  [[ -z $model ]] || [[ $model =~ $model_pattern ]] || model=''
+  target_cwd=$(map_path "$cwd" "$machine")
+  identity=$(account_identity "$account"); key=$(account_key "$account")
+  mapfile -t outs < <(out_arguments)
+  if ! answer=$(REMOTE_TIMEOUT=60 remote_udarnik "$destination" _receive --check --cwd "$target_cwd" --identity "$identity" \
+      --key "$key" "${outs[@]}" </dev/null 2>&1); then
+    log "session ${id:0:8}: $machine cannot take it: $(tail -n 1 <<<"$answer")"
+    printf '%s cannot take session %s: %s\n' "$machine" "${id:0:8}" "$(tail -n 1 <<<"$answer")" >&2
+    return 1
+  fi
+  log "session ${id:0:8}: moving to $machine ($target_cwd), because $reason"
+  # The keep of a session that leaves does not follow it: dropped before the process closes, or the service here would
+  # bring the closed session back; put back when the move fails.
+  kept_before=$(kept_record "$id")
+  [[ -z $kept_before ]] || kept_forget "$id"
+  if ! close_process "$pid" "$(jq -r '.procStart // empty' "$account/sessions/$pid.json" 2>/dev/null)"; then
+    log "session ${id:0:8}: process $pid did not end; nothing was moved"
+    printf 'process %s did not end; nothing was moved\n' "$pid" >&2
+    [[ -z $kept_before ]] || kept_restore "$kept_before"
+    return 1
+  fi
+  source_dir=$(dirname -- "$history")
+  members=("$id.jsonl")
+  [[ ! -d $source_dir/$id ]] || members+=("$id")
+  if ! answer=$(tar -C "$source_dir" -cf - -- "${members[@]}" | REMOTE_TIMEOUT=300 remote_udarnik "$destination" _receive \
+      --cwd "$target_cwd" --id "$id" --from "$(self_name)" --from-cwd "$cwd" --identity "$identity" --key "$key" \
+      --model "$model" --effort "$effort" --permission "$permission" --reason "$reason" "${outs[@]}" 2>&1) \
+      || ! jq -e '.window' >/dev/null 2>&1 <<<"$(tail -n 1 <<<"$answer")"; then
+    log "ATTENTION session ${id:0:8}: closed here, but it did not start on $machine ($(tail -n 1 <<<"$answer")); resume it by hand with: cd $cwd && claude --resume $id"
+    [[ -z $kept_before ]] || kept_restore "$kept_before"
+    printf 'session %s was closed here but did not start on %s: %s\nResume it by hand: cd %s && claude --resume %s\n' \
+      "${id:0:8}" "$machine" "$(tail -n 1 <<<"$answer")" "$cwd" "$id" >&2
+    return 2
+  fi
+  answer=$(tail -n 1 <<<"$answer")
+  sessions_rewrite '. + [$record]' --argjson record "$(jq -c --arg original "$id" --arg from "$account" --arg machine "$machine" \
+    --arg cwd "$target_cwd" --argjson at "$(now)" \
+    '{original:$original, from:$from, machine:$machine, to:.account, clone:.clone, window:.window, window_id:.window_id,
+      attach:.attach, attach_local:.attach_local, cwd:$cwd, at:$at, state:"moved"}' <<<"$answer")"
+  log "session ${id:0:8}: moved to $machine, clone $(jq -r '(.clone // "")[0:8]' <<<"$answer") on $(jq -r '.account | split("/") | last | ltrimstr(".")' <<<"$answer"), window $(jq -r '.window' <<<"$answer")"
+  if [[ -n $kept_before ]]; then
+    log "session ${id:0:8} was kept here; the keep does not follow it. To keep the clone there: udarnik keep $(jq -r '(.clone // "")[0:8]' <<<"$answer") --on $machine"
+  fi
+  printf '%s\n' "$answer"
+}
+
+pinned_refusal() {
+  printf 'udarnik: session %s is pinned to %s: it changes accounts here but never moves to another machine; nothing was closed. To move it, first: udarnik unpin %s\n' \
+    "${1:0:8}" "$(self_name)" "${1:0:8}"
+}
+
+# When no account here has quota: the first other machine of the fleet that can take the session gets it.
+fleet_take_over() {
+  local line=$1 account=$2 name destination self status
+  [[ ${UDARNIK_FLEET_TAKEOVER:-on} != off ]] && has_fleet || return 1
+  # A pinned session changes accounts only on this machine.
+  ! is_pinned "$(jq -r '.id' <<<"$line")" || return 1
+  while IFS=$'\t' read -r name destination self; do
+    [[ $self != true ]] || continue
+    status=0
+    move_session "$line" "$name" "$destination" \
+      "account $(account_key "$account") hit its usage limit and no account on $(self_name) has quota" >/dev/null || status=$?
+    ((status == 1)) || return 0
+  done < <(fleet_machines)
+  return 1
+}
+
+cmd_move() {
+  local wanted='' to='' destination matches count line result background=false
+  while (($#)); do
+    case "$1" in
+      --to) (($# >= 2)) || die '--to requires a machine name'; to=$2; shift 2 ;;
+      --background) background=true; shift ;;
+      -*) die "unknown move option: $1" ;;
+      *) wanted=$1; shift ;;
+    esac
+  done
+  [[ -n $wanted && -n $to ]] || die 'usage: udarnik move ID --to MACHINE'
+  ! is_self "$to" || die "the session is already on $to"
+  destination=$(machine_destination "$to") || die "no machine named $to in $FLEET_FILE"
+  matches=$(scan_sessions any | jq -sc --arg w "$wanted" '[.[] | select(.id | startswith($w))]')
+  count=$(jq 'length' <<<"$matches")
+  ((count > 0)) || die "no live session here starts with $wanted; see: udarnik status"
+  ((count == 1)) || die "$count live sessions start with $wanted; give more of the id"
+  line=$(jq -c '.[0]' <<<"$matches")
+  if is_pinned "$(jq -r '.id' <<<"$line")"; then
+    pinned_refusal "$(jq -r '.id' <<<"$line")" >&2
+    exit 1
+  fi
+  # Moving the session this command runs in would end the command with it: the move goes on detached.
+  if ! $background && is_ancestor "$(jq -r '.pid' <<<"$line")"; then
+    mkdir -p -- "$STATE"
+    setsid -f "$SCRIPT_DIR/udarnik" move "$wanted" --to "$to" --background </dev/null >>"$STATE/move.out" 2>&1
+    note "This is the session being moved: it closes in a moment and continues on $to. Follow it with: udarnik status --on $to"
+    return 0
+  fi
+  note "Moving session $(jq -r '.id[0:8]' <<<"$line") ($(jq -r '.probe.title // "untitled"' <<<"$line")) to $to..."
+  result=$(move_session "$line" "$to" "$destination" "the owner moved it") || exit 1
+  note "It now runs on $to, account $(jq -r '.account | split("/") | last | ltrimstr(".")' <<<"$result"), window $(jq -r '.window' <<<"$result")."
+  if [[ -z $(jq -r '.clone // empty' <<<"$result") ]]; then
+    note "Warning: the clone did not register its session in time; it may be waiting on a screen there. Look at it:"
+  fi
+  note "To see it, paste in a terminal:"
+  note "  $(jq -r '.attach' <<<"$result")"
+}
+
+# The receiving end of a move (run over ssh by the machine the session leaves). --check only says whether this
+# machine can take it; otherwise the history arrives as a tar on stdin, a fork is resumed in the tmux here, and the
+# answer is one JSON line: account, clone, window, window_id, attach.
+cmd_receive() {
+  local check=false cwd='' id='' from='another machine' from_cwd='' identity='' key='' model='' effort='' permission=''
+  local reason='the owner moved it' account='' preferred folder message started window_id name pair clone_id='' entry
+  local -a outs=()
+  while (($#)); do
+    case "$1" in
+      --check) check=true; shift; continue ;;
+      --cwd) cwd=${2-} ;; --id) id=${2-} ;; --from) from=${2-} ;; --from-cwd) from_cwd=${2-} ;;
+      --identity) identity=${2-} ;; --key) key=${2-} ;; --model) model=${2-} ;; --effort) effort=${2-} ;;
+      --permission) permission=${2-} ;; --reason) reason=${2-} ;; --out) outs+=("${2-}") ;;
+      *) die "unknown option: $1" ;;
+    esac
+    (($# >= 2)) || die "$1 requires a value"
+    shift 2
+  done
+  mkdir -p -- "$STATE"
+  for entry in "${outs[@]}"; do learn_out_argument "$entry" "$from"; done
+  [[ -d $cwd ]] || die "folder $cwd does not exist on $(self_name)"
+  command -v "$CLAUDE_COMMAND" >/dev/null 2>&1 || die "command $CLAUDE_COMMAND is not in PATH on $(self_name)"
+  command -v tmux >/dev/null 2>&1 || die "tmux is not installed on $(self_name)"
+  if preferred=$(account_matching "$identity" "$key") && account_available "$preferred" && account_onboarded "$preferred"; then
+    account=$preferred
+  elif ! account=$(PICK_ONBOARDED=1 PICK_KIND=interactive account_pick); then
+    if account=$(account_pick); then
+      die "account $(account_key "$account") has quota on $(self_name) but Claude Code was never opened interactively in it there; open it once: $(account_env "$account") claude"
+    fi
+    die "no account has quota on $(self_name) until $(local_time "$(accounts_next_available_epoch)")"
+  fi
+  if $check; then printf '%s\n' "$account"; return 0; fi
+  [[ $id =~ ^[A-Za-z0-9-]+$ ]] || die "not a session id: $id"
+  [[ -z $effort ]] || [[ $effort =~ ^(low|medium|high|xhigh|max)$ ]] || effort=''
+  [[ -z $model ]] || [[ $model =~ $model_pattern ]] || model=''
+  folder="$account/projects/$(sed -E 's/[^A-Za-z0-9]/-/g' <<<"$cwd")"
+  mkdir -p -- "$folder"
+  tar -xf - -C "$folder" || die "the history did not arrive"
+  [[ -f $folder/$id.jsonl ]] || die "the history did not arrive"
+  message=$(move_message "$from" "${from_cwd:-$cwd}" "$(self_name)" "$cwd" "$account" "$reason")
+  started=$(start_clone "$id" "$cwd" "$account" "$model" "$effort" "$permission" "$message") || die "the clone did not start in tmux"
+  window_id=${started%% *}; name=${started#* }
+  if pair=$(discover_clone "$account" "$window_id" "$id"); then
+    clone_id=${pair%% *}
+  else
+    log "ATTENTION session ${id:0:8} from $from: the clone started in window $name but did not register its session; check with: $(UDARNIK_VIA='' attach_command "$name")"
+  fi
+  sessions_rewrite '. + [$record]' --argjson record "$(jq -cn --arg original "$id" --arg from "$from" --arg clone "$clone_id" \
+    --arg to "$account" --arg window "$name" --arg window_id "$window_id" --arg cwd "$cwd" --argjson at "$(now)" \
+    '{original:$original, from:$from, came_from:$from, clone:$clone, to:$to, window:$window, window_id:$window_id, cwd:$cwd, at:$at, state:"running"}')"
+  log "session ${id:0:8} arrived from $from; clone ${clone_id:0:8} on $(account_key "$account"), window $name"
+  jq -cn --arg account "$account" --arg clone "$clone_id" --arg window "$name" --arg window_id "$window_id" \
+    --arg attach "$(attach_command "$name")" --arg local "$(UDARNIK_VIA='' attach_command "$name")" \
+    '{account:$account, clone:$clone, window:$window, window_id:$window_id, attach:$attach, attach_local:$local}'
+}
+
+# ---------------------------------------------------------------- dispatch
+
 command=${1:-}
 (($#)) && shift
+# --on MACHINE runs start, stop, status, runners, view, move, pin, unpin, pins, keep and unkeep there; --fleet runs start, stop,
+# status and runners on every machine.
+on='' fleet=false
+if [[ $command =~ ^(start|stop|status|runners|view|move|pin|unpin|pins|keep|unkeep)$ ]]; then
+  arguments=()
+  while (($#)); do
+    case "$1" in
+      --on) (($# >= 2)) || die '--on requires a machine name'; on=$2; shift 2 ;;
+      --fleet) fleet=true; shift ;;
+      *) arguments+=("$1"); shift ;;
+    esac
+  done
+  set -- "${arguments[@]+"${arguments[@]}"}"
+  if [[ -n $on ]] && ! is_self "$on"; then
+    destination=$(machine_destination "$on") || die "no machine named $on in $FLEET_FILE"
+    case "$command" in
+      view) view_remote "$on" "$destination" "$@" ;;
+      status)
+        if [[ ${1:-} == --json ]]; then REMOTE_TIMEOUT=60 remote_udarnik "$destination" status --json </dev/null
+        else
+          data=$(REMOTE_TIMEOUT=60 remote_udarnik "$destination" status --json </dev/null) || die "could not reach $on"
+          printf '== %s\n' "$on"; render_status "$data"
+          printf '\nTo see its sessions: udarnik view --on %s\n' "$on"
+        fi ;;
+      *) remote_udarnik "$destination" "$command" "$@" ;;
+    esac
+    exit
+  fi
+  if $fleet; then
+    case "$command" in
+      status) cmd_fleet_status "$@" ;;
+      start|stop|runners) fleet_each "$command" "$@" ;;
+      *) die '--fleet works with start, stop, status and runners' ;;
+    esac
+    exit
+  fi
+fi
 case "$command" in
   start) cmd_start "$@" ;;
   status) cmd_status "$@" ;;
   stop) cmd_stop "$@" ;;
+  runners) cmd_runners "$@" ;;
   view) cmd_view "$@" ;;
+  move) cmd_move "$@" ;;
+  pin) cmd_pin "$@" ;;
+  unpin) cmd_unpin "$@" ;;
+  pins) cmd_pins "$@" ;;
+  keep) cmd_keep "$@" ;;
+  unkeep) cmd_unkeep "$@" ;;
   account) cmd_account "$@" ;;
   _serve) cmd_serve "$@" ;;
+  _receive) cmd_receive "$@" ;;
+  _tell) fleet_tell_now "$@" ;;
   help|-h|--help|'') usage ;;
   *) usage >&2; die "unknown command: $command" ;;
 esac
